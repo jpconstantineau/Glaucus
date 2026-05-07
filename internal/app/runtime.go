@@ -38,6 +38,7 @@ type Runtime struct {
 	providers  providers.Catalog
 	sessions   *sessions.Service
 	jobs       *jobs.Service
+	scheduler  *jobs.Scheduler
 	events     *agentruntime.EventService
 	prompts    *agentruntime.PromptBuilder
 	router     *providers.Router
@@ -110,6 +111,18 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	tools.RegisterJobTools(runtime.tools, jobToolAdapter{service: runtime.jobs})
 	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
+	pollInterval, err := time.ParseDuration(loadedConfig.Config.Cron.PollInterval)
+	if err != nil || pollInterval <= 0 {
+		pollInterval = time.Minute
+	}
+	runtime.scheduler = jobs.NewScheduler(activeProfile.Slug, loadedConfig.Config.Cron.Enabled, pollInterval, runtime.jobs, runtime.sessions, jobs.RuntimeExecutor{
+		Profile:       activeProfile,
+		Config:        loadedConfig.Config,
+		Sessions:      runtime.sessions,
+		PromptBuilder: runtime.prompts,
+		Orchestrator:  runtime.runs,
+		ToolRegistry:  runtime.tools,
+	}, runtime.events)
 
 	sessionTTL, err := time.ParseDuration(loadedConfig.Config.Web.SessionTTL)
 	if err != nil || sessionTTL <= 0 {
@@ -144,6 +157,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		serveDone:        make(chan error, 1),
 	}
 	runtime.lifecycle.Add(runtime.server)
+	runtime.lifecycle.Add(runtime.scheduler)
 
 	return runtime, nil
 }

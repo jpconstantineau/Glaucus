@@ -439,6 +439,36 @@ func (s *Service) ListRuns(ctx context.Context, sessionID string) ([]Run, error)
 	return runs, nil
 }
 
+func (s *Service) ListActiveRuns(ctx context.Context, profileID string, limit int) ([]Run, error) {
+	if strings.TrimSpace(profileID) == "" {
+		return nil, errors.New("profile id is required")
+	}
+
+	records, err := s.app.FindRecordsByFilter(
+		CollectionRuns,
+		"profile_id = {:profile_id} && (status = 'queued' || status = 'running')",
+		"",
+		limit,
+		0,
+		dbx.Params{"profile_id": profileID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list active runs: %w", err)
+	}
+
+	runs := make([]Run, 0, len(records))
+	for _, record := range records {
+		run, err := runFromRecord(record)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+
+	_ = ctx
+	return runs, nil
+}
+
 func (s *Service) nextOrdinal(sessionID string) (int, error) {
 	records, err := s.app.FindRecordsByFilter(
 		CollectionMessages,
