@@ -5,12 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
+	"github.com/jpconstantineau/Glaucus/internal/web"
 	"github.com/pocketbase/pocketbase"
+	"github.com/pocketbase/pocketbase/apis"
+	"github.com/pocketbase/pocketbase/core"
 )
 
 type RuntimeOptions struct {
@@ -27,6 +31,8 @@ type Runtime struct {
 	profile    profile.ActiveProfile
 	config     config.Loaded
 	providers  providers.Catalog
+	web        *web.Module
+	server     *pocketbaseService
 }
 
 func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
@@ -79,7 +85,32 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		providers:  catalog,
 	}
 
-	runtime.lifecycle.Add(&pocketbaseService{app: pb})
+	sessionTTL, err := time.ParseDuration(loadedConfig.Config.Web.SessionTTL)
+	if err != nil || sessionTTL <= 0 {
+		sessionTTL = 24 * time.Hour
+	}
+
+	runtime.web = web.Register(pb, web.Options{
+		AppName:                 opts.Name,
+		Version:                 "dev",
+		Commit:                  "local",
+		BuiltAt:                 "unknown",
+		BindAddress:             loadedConfig.Config.Web.BindAddress,
+		SessionTTL:              sessionTTL,
+		Profile:                 activeProfile,
+		ProviderCatalog:         catalog,
+		DefaultOperatorEmail:    "admin@glaucus.local",
+		DefaultOperatorPassword: "glaucus-admin",
+	})
+
+	runtime.server = &pocketbaseService{
+		app:              pb,
+		bindAddress:      loadedConfig.Config.Web.BindAddress,
+		operatorEmail:    "admin@glaucus.local",
+		operatorPassword: "glaucus-admin",
+		serveDone:        make(chan error, 1),
+	}
+	runtime.lifecycle.Add(runtime.server)
 
 	return runtime, nil
 }
@@ -89,7 +120,13 @@ func (r *Runtime) Run(ctx context.Context) error {
 		return err
 	}
 
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-r.server.serveDone:
+		if err != nil {
+			return err
+		}
+	}
 
 	if err := r.lifecycle.Stop(context.Background()); err != nil {
 		return fmt.Errorf("shutdown %s: %w", r.name, err)
@@ -99,7 +136,11 @@ func (r *Runtime) Run(ctx context.Context) error {
 }
 
 type pocketbaseService struct {
-	app *pocketbase.PocketBase
+	app              *pocketbase.PocketBase
+	bindAddress      string
+	operatorEmail    string
+	operatorPassword string
+	serveDone        chan error
 }
 
 func (s *pocketbaseService) Name() string {
@@ -107,11 +148,38 @@ func (s *pocketbaseService) Name() string {
 }
 
 func (s *pocketbaseService) Start(context.Context) error {
+	if err := s.app.Bootstrap(); err != nil {
+		return err
+	}
+	if err := s.app.RunAllMigrations(); err != nil {
+		return err
+	}
+	if err := web.EnsureDefaultOperator(s.app, s.operatorEmail, s.operatorPassword); err != nil {
+		return err
+	}
+
+	go func() {
+		s.serveDone <- apis.Serve(s.app, apis.ServeConfig{
+			HttpAddr:        s.bindAddress,
+			ShowStartBanner: false,
+		})
+	}()
+
 	return nil
 }
 
 func (s *pocketbaseService) Stop(context.Context) error {
-	event := new(struct{})
-	_ = event
-	return s.app.ResetBootstrapState()
+	event := &core.TerminateEvent{App: s.app}
+	if err := s.app.OnTerminate().Trigger(event, func(e *core.TerminateEvent) error {
+		return e.App.ResetBootstrapState()
+	}); err != nil {
+		return err
+	}
+
+	select {
+	case err := <-s.serveDone:
+		return err
+	default:
+		return nil
+	}
 }
