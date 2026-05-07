@@ -9,10 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jpconstantineau/Glaucus/internal/config"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
+	"github.com/jpconstantineau/Glaucus/internal/sessions"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 	_ "github.com/pocketbase/pocketbase/migrations"
@@ -52,7 +54,11 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		SessionTTL:              24 * time.Hour,
 		Profile:                 profile.ActiveProfile{Slug: "default"},
 		ProviderCatalog:         providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1"}}},
+		SessionService:          sessions.NewService(app),
 		EventService:            runtime.NewEventService(app),
+		PromptBuilder:           runtime.NewPromptBuilder(),
+		Orchestrator:            runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, config.Default()), runtime.NewEventService(app)),
+		LoadedConfig:            config.Default(),
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
 	}}
@@ -152,6 +158,19 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	}
 	if !strings.Contains(streamRes.Body.String(), "event: run.completed") || !strings.Contains(streamRes.Body.String(), runEvent.ID) {
 		t.Fatalf("expected run event in SSE response, got %s", streamRes.Body.String())
+	}
+
+	chatReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/chat", nil)
+	chatReq.Host = "127.0.0.1:8090"
+	chatReq.AddCookie(sessionCookie)
+	chatReq.AddCookie(csrfCookie)
+	chatRes := httptest.NewRecorder()
+	mux.ServeHTTP(chatRes, chatReq)
+	if chatRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /chat, got %d", chatRes.Code)
+	}
+	if !strings.Contains(chatRes.Body.String(), "Send Prompt") || !strings.Contains(chatRes.Body.String(), "Streaming Output") {
+		t.Fatalf("expected chat page to render MVP controls, got %s", chatRes.Body.String())
 	}
 }
 

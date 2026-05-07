@@ -11,6 +11,8 @@ import (
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
+	agentruntime "github.com/jpconstantineau/Glaucus/internal/runtime"
+	"github.com/jpconstantineau/Glaucus/internal/sessions"
 	"github.com/jpconstantineau/Glaucus/internal/web"
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/apis"
@@ -31,6 +33,11 @@ type Runtime struct {
 	profile    profile.ActiveProfile
 	config     config.Loaded
 	providers  providers.Catalog
+	sessions   *sessions.Service
+	events     *agentruntime.EventService
+	prompts    *agentruntime.PromptBuilder
+	router     *providers.Router
+	runs       *agentruntime.Orchestrator
 	web        *web.Module
 	server     *pocketbaseService
 }
@@ -84,6 +91,11 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		config:     loadedConfig,
 		providers:  catalog,
 	}
+	runtime.sessions = sessions.NewService(pb)
+	runtime.events = agentruntime.NewEventService(pb)
+	runtime.prompts = agentruntime.NewPromptBuilder()
+	runtime.router = providers.NewRouter(catalog, loadedConfig.Config)
+	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events)
 
 	sessionTTL, err := time.ParseDuration(loadedConfig.Config.Web.SessionTTL)
 	if err != nil || sessionTTL <= 0 {
@@ -99,6 +111,11 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		SessionTTL:              sessionTTL,
 		Profile:                 activeProfile,
 		ProviderCatalog:         catalog,
+		SessionService:          runtime.sessions,
+		EventService:            runtime.events,
+		PromptBuilder:           runtime.prompts,
+		Orchestrator:            runtime.runs,
+		LoadedConfig:            loadedConfig.Config,
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
 	})
