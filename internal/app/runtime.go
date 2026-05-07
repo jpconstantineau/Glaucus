@@ -102,6 +102,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	tools.RegisterFileTools(runtime.tools)
 	processService := tools.NewBackgroundProcessService(pb)
 	tools.RegisterProcessTools(runtime.tools, processService)
+	tools.RegisterWebTools(runtime.tools, tools.NewHTTPWebBackend(), nil)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools)
 
 	sessionTTL, err := time.ParseDuration(loadedConfig.Config.Web.SessionTTL)
