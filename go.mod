@@ -1,4 +1,4 @@
-module chatbase
+module github.com/jpconstantineau/Glaucus
 
 go 1.26.2
 
