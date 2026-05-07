@@ -9,6 +9,7 @@ import (
 
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
@@ -36,6 +37,7 @@ type Runtime struct {
 	config     config.Loaded
 	providers  providers.Catalog
 	sessions   *sessions.Service
+	jobs       *jobs.Service
 	events     *agentruntime.EventService
 	prompts    *agentruntime.PromptBuilder
 	router     *providers.Router
@@ -95,6 +97,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		providers:  catalog,
 	}
 	runtime.sessions = sessions.NewService(pb)
+	runtime.jobs = jobs.NewService(pb)
 	runtime.events = agentruntime.NewEventService(pb)
 	runtime.prompts = agentruntime.NewPromptBuilder()
 	runtime.router = providers.NewRouter(catalog, loadedConfig.Config)
@@ -104,6 +107,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	processService := tools.NewBackgroundProcessService(pb)
 	tools.RegisterProcessTools(runtime.tools, processService)
 	tools.RegisterWebTools(runtime.tools, tools.NewHTTPWebBackend(), nil)
+	tools.RegisterJobTools(runtime.tools, jobToolAdapter{service: runtime.jobs})
 	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
 
