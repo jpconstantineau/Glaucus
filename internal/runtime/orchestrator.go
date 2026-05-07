@@ -27,6 +27,7 @@ type ExecuteRunInput struct {
 	UserMessageID    string
 	Surface          string
 	ToolResolution   tools.Resolution
+	ToolInvocation   *tools.Invocation
 	Prompt           PromptDocument
 	Request          providers.NormalizedRequest
 	Resolution       providers.ResolutionInput
@@ -44,13 +45,15 @@ type Orchestrator struct {
 	sessions *sessions.Service
 	router   *providers.Router
 	events   *EventService
+	tools    *tools.Registry
 }
 
-func NewOrchestrator(sessionService *sessions.Service, router *providers.Router, eventService *EventService) *Orchestrator {
+func NewOrchestrator(sessionService *sessions.Service, router *providers.Router, eventService *EventService, registry *tools.Registry) *Orchestrator {
 	return &Orchestrator{
 		sessions: sessionService,
 		router:   router,
 		events:   eventService,
+		tools:    registry,
 	}
 }
 
@@ -78,6 +81,7 @@ func (o *Orchestrator) QueueRun(ctx context.Context, input ExecuteRunInput) (ses
 			"prompt":           RenderPrompt(input.Prompt),
 			"prompt_fragments": input.Prompt.Fragments,
 			"tool_selection":   input.ToolResolution,
+			"tool_invocation":  input.ToolInvocation,
 		},
 	})
 	if err != nil {
@@ -101,6 +105,10 @@ func (o *Orchestrator) ProcessRun(ctx context.Context, run sessions.Run, input E
 		return ExecuteRunResult{}, fmt.Errorf("mark run running: %w", err)
 	}
 	o.appendEvent(persistCtx, run, "run.started", map[string]any{"status": RunStatusRunning}, false)
+
+	if input.ToolInvocation != nil {
+		return o.processToolRun(ctx, run, input)
+	}
 
 	if err := ctx.Err(); err != nil {
 		cancelledRun, cancelErr := o.cancelRun(context.Background(), run.ID, nil)
@@ -178,6 +186,124 @@ func (o *Orchestrator) ProcessRun(ctx context.Context, run sessions.Run, input E
 	}, nil
 }
 
+func (o *Orchestrator) processToolRun(ctx context.Context, run sessions.Run, input ExecuteRunInput) (ExecuteRunResult, error) {
+	if o.tools == nil {
+		return o.failToolRun(run, "tool_runtime_unavailable", "tool runtime unavailable")
+	}
+
+	invocation := input.ToolInvocation
+	if invocation == nil {
+		return o.failToolRun(run, "tool_invocation_missing", "tool invocation missing")
+	}
+
+	if !containsTool(input.ToolResolution.ToolNames, invocation.Name) {
+		return o.failToolRun(run, "tool_not_enabled", fmt.Sprintf("tool %q is not enabled by the selected toolset", invocation.Name))
+	}
+
+	tool, ok := o.tools.Tool(invocation.Name)
+	if !ok {
+		return o.failToolRun(run, "tool_not_registered", fmt.Sprintf("tool %q is not registered", invocation.Name))
+	}
+
+	o.appendEvent(context.Background(), run, "tool.started", map[string]any{
+		"name":      invocation.Name,
+		"arguments": invocation.Arguments,
+	}, false)
+
+	result := tool.Execute(ctx, tools.ToolRequest{
+		ProfileID:        input.ProfileID,
+		SessionID:        input.SessionID,
+		RunID:            run.ID,
+		Surface:          input.Surface,
+		ProfileRoot:      input.WorkingDirectory,
+		WorkingDirectory: input.WorkingDirectory,
+		Arguments:        invocation.Arguments,
+	})
+
+	status := RunStatusCompleted
+	errorCode := ""
+	errorMessage := ""
+	eventType := "tool.completed"
+
+	switch result.Status {
+	case tools.StatusSuccess:
+		o.appendEvent(context.Background(), run, "assistant.completed", map[string]any{"text": result.DisplayText}, false)
+	case tools.StatusValidationError:
+		status = RunStatusFailed
+		errorCode = "tool_validation_error"
+		errorMessage = result.DisplayText
+		eventType = "tool.failed"
+	case tools.StatusFatalError, tools.StatusRecoverableError:
+		status = RunStatusFailed
+		errorCode = "tool_execution_error"
+		errorMessage = result.DisplayText
+		eventType = "tool.failed"
+	default:
+		status = RunStatusFailed
+		errorCode = "tool_execution_error"
+		errorMessage = result.DisplayText
+		eventType = "tool.failed"
+	}
+
+	o.appendEvent(context.Background(), run, eventType, map[string]any{
+		"name":       invocation.Name,
+		"status":     result.Status,
+		"payload":    result.Payload,
+		"diagnostic": result.Diagnostics,
+		"text":       result.DisplayText,
+	}, true)
+
+	updatedRun, err := o.sessions.UpdateRun(context.Background(), run.ID, sessions.UpdateRunInput{
+		Status:  status,
+		EndedAt: time.Now().UTC(),
+		ProviderResolution: map[string]any{
+			"tool_result": map[string]any{
+				"name":   invocation.Name,
+				"status": result.Status,
+				"result": result.Payload,
+			},
+		},
+		ErrorCode:    errorCode,
+		ErrorMessage: errorMessage,
+	})
+	if err != nil {
+		return ExecuteRunResult{}, fmt.Errorf("update tool run: %w", err)
+	}
+
+	if status != RunStatusCompleted {
+		return ExecuteRunResult{
+			Run: updatedRun,
+			Response: providers.NormalizedResponse{
+				OutputText: result.DisplayText,
+			},
+		}, errors.New(result.DisplayText)
+	}
+
+	return ExecuteRunResult{
+		Run: updatedRun,
+		Response: providers.NormalizedResponse{
+			OutputText: result.DisplayText,
+		},
+	}, nil
+}
+
+func (o *Orchestrator) failToolRun(run sessions.Run, code, message string) (ExecuteRunResult, error) {
+	updatedRun, err := o.sessions.UpdateRun(context.Background(), run.ID, sessions.UpdateRunInput{
+		Status:       RunStatusFailed,
+		EndedAt:      time.Now().UTC(),
+		ErrorCode:    code,
+		ErrorMessage: message,
+	})
+	if err != nil {
+		return ExecuteRunResult{}, err
+	}
+	o.appendEvent(context.Background(), updatedRun, "tool.failed", map[string]any{
+		"status": RunStatusFailed,
+		"error":  message,
+	}, true)
+	return ExecuteRunResult{Run: updatedRun}, errors.New(message)
+}
+
 func (o *Orchestrator) cancelRun(ctx context.Context, runID string, attempts []providers.AttemptRecord) (sessions.Run, error) {
 	run, err := o.sessions.UpdateRun(ctx, runID, sessions.UpdateRunInput{
 		Status:       RunStatusCancelled,
@@ -238,4 +364,13 @@ func splitTextChunks(text string) []string {
 	}
 	chunks = append(chunks, current)
 	return chunks
+}
+
+func containsTool(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }

@@ -26,7 +26,7 @@ func TestOrchestratorExecuteSuccess(t *testing.T) {
 		})
 	})
 	service := sessions.NewService(newRuntimeTestApp(t))
-	orch := NewOrchestrator(service, router, nil)
+	orch := NewOrchestrator(service, router, nil, nil)
 	session := createRuntimeTestSession(t, service)
 
 	result, err := orch.Execute(context.Background(), ExecuteRunInput{
@@ -74,7 +74,7 @@ func TestOrchestratorExecuteFallbackAfterRecoverableFailure(t *testing.T) {
 	}}
 	router := providers.NewRouter(catalog, config.Default())
 	service := sessions.NewService(newRuntimeTestApp(t))
-	orch := NewOrchestrator(service, router, nil)
+	orch := NewOrchestrator(service, router, nil, nil)
 	session := createRuntimeTestSession(t, service)
 
 	result, err := orch.Execute(context.Background(), ExecuteRunInput{
@@ -104,7 +104,7 @@ func TestOrchestratorExecuteFailure(t *testing.T) {
 		http.Error(w, "hard failure", http.StatusInternalServerError)
 	})
 	service := sessions.NewService(newRuntimeTestApp(t))
-	orch := NewOrchestrator(service, router, nil)
+	orch := NewOrchestrator(service, router, nil, nil)
 	session := createRuntimeTestSession(t, service)
 
 	result, err := orch.Execute(context.Background(), ExecuteRunInput{
@@ -128,7 +128,7 @@ func TestOrchestratorExecuteFailure(t *testing.T) {
 func TestOrchestratorExecuteCancellation(t *testing.T) {
 	router := providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{chatEntry("primary", "http://127.0.0.1:1")}}, config.Default())
 	service := sessions.NewService(newRuntimeTestApp(t))
-	orch := NewOrchestrator(service, router, nil)
+	orch := NewOrchestrator(service, router, nil, nil)
 	session := createRuntimeTestSession(t, service)
 
 	ctx, cancel := context.WithCancel(context.Background())

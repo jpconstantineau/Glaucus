@@ -47,19 +47,29 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	}
 
 	module := &Module{options: Options{
-		AppName:                 "Glaucus",
-		Version:                 "dev",
-		Commit:                  "local",
-		BuiltAt:                 "now",
-		BindAddress:             "127.0.0.1:8090",
-		SessionTTL:              24 * time.Hour,
-		Profile:                 profile.ActiveProfile{Slug: "default"},
-		ProviderCatalog:         providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1"}}},
-		SessionService:          sessions.NewService(app),
-		EventService:            runtime.NewEventService(app),
-		PromptBuilder:           runtime.NewPromptBuilder(),
-		Orchestrator:            runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, config.Default()), runtime.NewEventService(app)),
-		ToolRegistry:            func() *tools.Registry { r := tools.NewRegistry(); tools.RegisterCatalogDefaults(r); return r }(),
+		AppName:         "Glaucus",
+		Version:         "dev",
+		Commit:          "local",
+		BuiltAt:         "now",
+		BindAddress:     "127.0.0.1:8090",
+		SessionTTL:      24 * time.Hour,
+		Profile:         profile.ActiveProfile{Slug: "default"},
+		ProviderCatalog: providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1"}}},
+		SessionService:  sessions.NewService(app),
+		EventService:    runtime.NewEventService(app),
+		PromptBuilder:   runtime.NewPromptBuilder(),
+		Orchestrator: runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, config.Default()), runtime.NewEventService(app), func() *tools.Registry {
+			r := tools.NewRegistry()
+			tools.RegisterCatalogDefaults(r)
+			tools.RegisterFileTools(r)
+			return r
+		}()),
+		ToolRegistry: func() *tools.Registry {
+			r := tools.NewRegistry()
+			tools.RegisterCatalogDefaults(r)
+			tools.RegisterFileTools(r)
+			return r
+		}(),
 		LoadedConfig:            config.Default(),
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
@@ -210,7 +220,12 @@ func TestLoginPageReusesExistingCSRFCookie(t *testing.T) {
 		SessionTTL:      24 * time.Hour,
 		Profile:         profile.ActiveProfile{Slug: "default"},
 		ProviderCatalog: providers.Catalog{},
-		ToolRegistry:    func() *tools.Registry { r := tools.NewRegistry(); tools.RegisterCatalogDefaults(r); return r }(),
+		ToolRegistry: func() *tools.Registry {
+			r := tools.NewRegistry()
+			tools.RegisterCatalogDefaults(r)
+			tools.RegisterFileTools(r)
+			return r
+		}(),
 	}}
 	module.BindRoutes(app, router)
 
@@ -263,4 +278,17 @@ func extractValue(body, prefix, suffix string) string {
 		return ""
 	}
 	return body[start : start+end]
+}
+
+func TestParseToolPrompt(t *testing.T) {
+	invocation, err := parseToolPrompt(`/tool read_file {"path":"SOUL.md","start_line":1}`)
+	if err != nil {
+		t.Fatalf("parse tool prompt: %v", err)
+	}
+	if invocation == nil || invocation.Name != "read_file" {
+		t.Fatalf("expected read_file invocation, got %+v", invocation)
+	}
+	if invocation.Arguments["path"] != "SOUL.md" {
+		t.Fatalf("expected path argument, got %+v", invocation.Arguments)
+	}
 }

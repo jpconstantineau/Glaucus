@@ -312,6 +312,10 @@ func (m *Module) chatSend(e *core.RequestEvent, _ *core.Record) error {
 	if promptText == "" {
 		return e.BadRequestError("prompt is required", nil)
 	}
+	invocation, parseErr := parseToolPrompt(promptText)
+	if parseErr != nil {
+		return e.BadRequestError(parseErr.Error(), nil)
+	}
 
 	profileID := m.options.Profile.Slug
 	var (
@@ -358,16 +362,19 @@ func (m *Module) chatSend(e *core.RequestEvent, _ *core.Record) error {
 		return e.InternalServerError("failed to persist user message", err)
 	}
 
-	promptDoc, err := m.options.PromptBuilder.Build(runtime.PromptBuildInput{
-		Profile:         m.options.Profile,
-		Session:         session,
-		ToolBehavior:    "Use toolset " + fallbackString(toolsetRef, "safe-default") + " unless no tools are needed.",
-		ProjectContext:  "Current profile root: " + m.options.Profile.Root,
-		PlatformHint:    "This turn originated from the browser chat surface.",
-		ProviderOverlay: "Prefer the selected provider/model unless a deterministic fallback is required.",
-	})
-	if err != nil {
-		return e.InternalServerError("failed to build prompt", err)
+	promptDoc := runtime.PromptDocument{}
+	if invocation == nil {
+		promptDoc, err = m.options.PromptBuilder.Build(runtime.PromptBuildInput{
+			Profile:         m.options.Profile,
+			Session:         session,
+			ToolBehavior:    "Use toolset " + fallbackString(toolsetRef, m.defaultToolset()) + " unless no tools are needed.",
+			ProjectContext:  "Current profile root: " + m.options.Profile.Root,
+			PlatformHint:    "This turn originated from the browser chat surface.",
+			ProviderOverlay: "Prefer the selected provider/model unless a deterministic fallback is required.",
+		})
+		if err != nil {
+			return e.InternalServerError("failed to build prompt", err)
+		}
 	}
 
 	input := runtime.ExecuteRunInput{
@@ -377,6 +384,7 @@ func (m *Module) chatSend(e *core.RequestEvent, _ *core.Record) error {
 		UserMessageID:  userMessage.ID,
 		Surface:        tools.SurfaceWebChat,
 		ToolResolution: toolResolution,
+		ToolInvocation: invocation,
 		Prompt:         promptDoc,
 		Request: providers.NormalizedRequest{
 			Messages:     []providers.RequestMessage{{Role: "user", Content: promptText}},
@@ -1066,4 +1074,34 @@ func fallbackString(value, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func parseToolPrompt(prompt string) (*tools.Invocation, error) {
+	trimmed := strings.TrimSpace(prompt)
+	if !strings.HasPrefix(trimmed, "/tool ") {
+		return nil, nil
+	}
+
+	body := strings.TrimSpace(strings.TrimPrefix(trimmed, "/tool "))
+	if body == "" {
+		return nil, fmt.Errorf("tool prompt must include a tool name")
+	}
+
+	parts := strings.SplitN(body, " ", 2)
+	name := strings.TrimSpace(parts[0])
+	if name == "" {
+		return nil, fmt.Errorf("tool prompt must include a tool name")
+	}
+
+	args := map[string]any{}
+	if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+		if err := json.Unmarshal([]byte(parts[1]), &args); err != nil {
+			return nil, fmt.Errorf("tool arguments must be valid JSON: %w", err)
+		}
+	}
+
+	return &tools.Invocation{
+		Name:      name,
+		Arguments: args,
+	}, nil
 }

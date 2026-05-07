@@ -99,7 +99,8 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.router = providers.NewRouter(catalog, loadedConfig.Config)
 	runtime.tools = tools.NewRegistry()
 	tools.RegisterCatalogDefaults(runtime.tools)
-	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events)
+	tools.RegisterFileTools(runtime.tools)
+	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools)
 
 	sessionTTL, err := time.ParseDuration(loadedConfig.Config.Web.SessionTTL)
 	if err != nil || sessionTTL <= 0 {
