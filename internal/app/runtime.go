@@ -9,11 +9,16 @@ import (
 
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
+	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/memory"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	agentruntime "github.com/jpconstantineau/Glaucus/internal/runtime"
+	"github.com/jpconstantineau/Glaucus/internal/search"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
+	"github.com/jpconstantineau/Glaucus/internal/skills"
 	"github.com/jpconstantineau/Glaucus/internal/tools"
 	"github.com/jpconstantineau/Glaucus/internal/web"
 	"github.com/pocketbase/pocketbase"
@@ -36,6 +41,13 @@ type Runtime struct {
 	config     config.Loaded
 	providers  providers.Catalog
 	sessions   *sessions.Service
+	jobs       *jobs.Service
+	memory     *memory.Service
+	search     *search.Service
+	skills     *skills.Service
+	exports    *exportsvc.Service
+	curator    *skills.Curator
+	scheduler  *jobs.Scheduler
 	events     *agentruntime.EventService
 	prompts    *agentruntime.PromptBuilder
 	router     *providers.Router
@@ -95,8 +107,13 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		providers:  catalog,
 	}
 	runtime.sessions = sessions.NewService(pb)
+	runtime.jobs = jobs.NewService(pb)
+	runtime.memory = memory.NewService(pb)
 	runtime.events = agentruntime.NewEventService(pb)
 	runtime.prompts = agentruntime.NewPromptBuilder()
+	runtime.search = search.NewService(pb, runtime.sessions)
+	runtime.skills = skills.NewService(pb)
+	runtime.exports = exportsvc.NewService(pb)
 	runtime.router = providers.NewRouter(catalog, loadedConfig.Config)
 	runtime.tools = tools.NewRegistry()
 	tools.RegisterCatalogDefaults(runtime.tools)
@@ -104,8 +121,24 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	processService := tools.NewBackgroundProcessService(pb)
 	tools.RegisterProcessTools(runtime.tools, processService)
 	tools.RegisterWebTools(runtime.tools, tools.NewHTTPWebBackend(), nil)
+	tools.RegisterJobTools(runtime.tools, jobToolAdapter{service: runtime.jobs})
+	tools.RegisterPlanningTools(runtime.tools, todoToolAdapter{service: runtime.sessions}, memoryToolAdapter{service: runtime.memory, profileRoot: activeProfile.Root}, searchToolAdapter{service: runtime.search})
+	tools.RegisterSkillsTools(runtime.tools, skillsToolAdapter{service: runtime.skills, profileRoot: activeProfile.Root})
 	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
+	pollInterval, err := time.ParseDuration(loadedConfig.Config.Cron.PollInterval)
+	if err != nil || pollInterval <= 0 {
+		pollInterval = time.Minute
+	}
+	runtime.scheduler = jobs.NewScheduler(activeProfile.Slug, loadedConfig.Config.Cron.Enabled, pollInterval, runtime.jobs, runtime.sessions, jobs.RuntimeExecutor{
+		Profile:       activeProfile,
+		Config:        loadedConfig.Config,
+		Sessions:      runtime.sessions,
+		PromptBuilder: runtime.prompts,
+		Orchestrator:  runtime.runs,
+		ToolRegistry:  runtime.tools,
+	}, runtime.events)
+	runtime.curator = skills.NewCurator(runtime.skills, 6*time.Hour)
 
 	sessionTTL, err := time.ParseDuration(loadedConfig.Config.Web.SessionTTL)
 	if err != nil || sessionTTL <= 0 {
@@ -122,6 +155,11 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		Profile:                 activeProfile,
 		ProviderCatalog:         catalog,
 		SessionService:          runtime.sessions,
+		JobService:              runtime.jobs,
+		SearchService:           runtime.search,
+		SkillsService:           runtime.skills,
+		ExportService:           runtime.exports,
+		Scheduler:               runtime.scheduler,
 		EventService:            runtime.events,
 		PromptBuilder:           runtime.prompts,
 		Orchestrator:            runtime.runs,
@@ -140,6 +178,8 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		serveDone:        make(chan error, 1),
 	}
 	runtime.lifecycle.Add(runtime.server)
+	runtime.lifecycle.Add(runtime.scheduler)
+	runtime.lifecycle.Add(runtime.curator)
 
 	return runtime, nil
 }

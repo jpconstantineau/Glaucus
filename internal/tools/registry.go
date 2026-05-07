@@ -289,7 +289,7 @@ func defaultToolsets() []Toolset {
 		{Name: "browser", Description: "Browser-backed tools", Tools: []string{"browser_navigate", "browser_snapshot"}},
 		{Name: "messaging", Description: "Messaging tools", Tools: []string{"send_message"}},
 		{Name: "skills", Description: "Skill inspection and management tools", Tools: []string{"skills_list", "skill_view", "skill_manage"}},
-		{Name: "todo", Description: "Todo tools", Tools: []string{"todo"}},
+		{Name: "todo", Description: "Todo and memory tools", Tools: []string{"todo", "memory"}},
 		{Name: "session_search", Description: "Session search tools", Tools: []string{"session_search"}},
 		{Name: "cronjob", Description: "Scheduled job tools", Tools: []string{"cronjob"}},
 		{Name: "delegation", Description: "Delegation tools", Tools: []string{"delegate_task"}},

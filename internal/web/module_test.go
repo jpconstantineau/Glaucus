@@ -11,11 +11,15 @@ import (
 
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	"github.com/jpconstantineau/Glaucus/internal/exports"
+	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
+	"github.com/jpconstantineau/Glaucus/internal/search"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
+	"github.com/jpconstantineau/Glaucus/internal/skills"
 	"github.com/jpconstantineau/Glaucus/internal/tools"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
@@ -58,6 +62,10 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		Profile:         profile.ActiveProfile{Slug: "default"},
 		ProviderCatalog: providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1"}}},
 		SessionService:  sessions.NewService(app),
+		JobService:      jobs.NewService(app),
+		SearchService:   search.NewService(app, sessions.NewService(app)),
+		SkillsService:   skills.NewService(app),
+		ExportService:   exports.NewService(app),
 		EventService:    runtime.NewEventService(app),
 		PromptBuilder:   runtime.NewPromptBuilder(),
 		Orchestrator: runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, config.Default()), runtime.NewEventService(app), func() *tools.Registry {
@@ -144,6 +152,9 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	if !strings.Contains(dashboardRes.Body.String(), "Pending Approvals") {
 		t.Fatal("expected dashboard to render approvals card")
 	}
+	if !strings.Contains(dashboardRes.Body.String(), "/dashboard/sessions") || !strings.Contains(dashboardRes.Body.String(), "/dashboard/jobs") {
+		t.Fatal("expected dashboard to link to operator console pages")
+	}
 
 	detailedReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/health/detailed", nil)
 	detailedReq.Host = "127.0.0.1:8090"
@@ -192,6 +203,22 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	}
 	if !strings.Contains(chatRes.Body.String(), "Tool Activity") {
 		t.Fatalf("expected chat page to render tool activity rail, got %s", chatRes.Body.String())
+	}
+
+	for _, path := range []string{
+		"/dashboard/sessions",
+		"/dashboard/jobs",
+		"/dashboard/skills",
+		"/dashboard/logs",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090"+path, nil)
+		req.Host = "127.0.0.1:8090"
+		req.AddCookie(sessionCookie)
+		res := httptest.NewRecorder()
+		mux.ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("expected 200 from %s, got %d", path, res.Code)
+		}
 	}
 }
 

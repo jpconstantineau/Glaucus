@@ -25,6 +25,9 @@ func TestCreateResumeAndListSessionData(t *testing.T) {
 		ToolsetSnapshot: map[string]any{
 			"name": "safe-default",
 		},
+		Todo: []map[string]any{
+			{"text": "Inspect repo", "done": false},
+		},
 	})
 	if err != nil {
 		t.Fatalf("create session: %v", err)
@@ -91,6 +94,9 @@ func TestCreateResumeAndListSessionData(t *testing.T) {
 	if resumedSession.ModelSnapshot["provider"] != "openrouter" {
 		t.Fatalf("expected provider snapshot to round-trip, got %#v", resumedSession.ModelSnapshot)
 	}
+	if len(resumedSession.Todo) != 1 {
+		t.Fatalf("expected todo snapshot to round-trip, got %#v", resumedSession.Todo)
+	}
 	if resumedSession.LastMessageAt.IsZero() {
 		t.Fatal("expected last_message_at to be updated")
 	}
@@ -123,6 +129,17 @@ func TestCreateResumeAndListSessionData(t *testing.T) {
 	}
 	if runs[0].Request["message_id"] != userMessage.ID {
 		t.Fatalf("expected run request to reference user message, got %#v", runs[0].Request)
+	}
+
+	updatedSession, err := service.ReplaceSessionTodo(ctx, session.ID, []map[string]any{
+		{"text": "Inspect repo", "done": true},
+		{"text": "Write tests", "done": false},
+	})
+	if err != nil {
+		t.Fatalf("replace session todo: %v", err)
+	}
+	if len(updatedSession.Todo) != 2 {
+		t.Fatalf("expected updated todo list, got %#v", updatedSession.Todo)
 	}
 }
 

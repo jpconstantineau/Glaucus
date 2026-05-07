@@ -35,6 +35,7 @@ type Session struct {
 	Status          string
 	ModelSnapshot   map[string]any
 	ToolsetSnapshot map[string]any
+	Todo            []map[string]any
 	LastMessageAt   time.Time
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
@@ -82,6 +83,7 @@ type CreateSessionInput struct {
 	Status          string
 	ModelSnapshot   map[string]any
 	ToolsetSnapshot map[string]any
+	Todo            []map[string]any
 }
 
 type CreateMessageInput struct {
@@ -158,6 +160,9 @@ func (s *Service) CreateSession(ctx context.Context, input CreateSessionInput) (
 	if err := setJSON(record, "toolset_snapshot_json", input.ToolsetSnapshot); err != nil {
 		return Session{}, err
 	}
+	if err := setJSON(record, "todo_json", input.Todo); err != nil {
+		return Session{}, err
+	}
 
 	if err := s.app.SaveWithContext(ctx, record); err != nil {
 		return Session{}, fmt.Errorf("save session: %w", err)
@@ -202,6 +207,20 @@ func (s *Service) ListSessions(ctx context.Context, profileID string, limit int)
 
 	_ = ctx
 	return sessions, nil
+}
+
+func (s *Service) ReplaceSessionTodo(ctx context.Context, sessionID string, items []map[string]any) (Session, error) {
+	record, err := s.app.FindRecordById(CollectionSessions, sessionID)
+	if err != nil {
+		return Session{}, fmt.Errorf("find session: %w", err)
+	}
+	if err := setJSON(record, "todo_json", items); err != nil {
+		return Session{}, err
+	}
+	if err := s.app.SaveWithContext(ctx, record); err != nil {
+		return Session{}, fmt.Errorf("update session todo: %w", err)
+	}
+	return sessionFromRecord(record)
 }
 
 func (s *Service) CreateMessage(ctx context.Context, input CreateMessageInput) (Message, error) {
@@ -439,6 +458,36 @@ func (s *Service) ListRuns(ctx context.Context, sessionID string) ([]Run, error)
 	return runs, nil
 }
 
+func (s *Service) ListActiveRuns(ctx context.Context, profileID string, limit int) ([]Run, error) {
+	if strings.TrimSpace(profileID) == "" {
+		return nil, errors.New("profile id is required")
+	}
+
+	records, err := s.app.FindRecordsByFilter(
+		CollectionRuns,
+		"profile_id = {:profile_id} && (status = 'queued' || status = 'running')",
+		"",
+		limit,
+		0,
+		dbx.Params{"profile_id": profileID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list active runs: %w", err)
+	}
+
+	runs := make([]Run, 0, len(records))
+	for _, record := range records {
+		run, err := runFromRecord(record)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+
+	_ = ctx
+	return runs, nil
+}
+
 func (s *Service) nextOrdinal(sessionID string) (int, error) {
 	records, err := s.app.FindRecordsByFilter(
 		CollectionMessages,
@@ -480,6 +529,9 @@ func sessionFromRecord(record *core.Record) (Session, error) {
 		return Session{}, err
 	}
 	if err := decodeJSONField(record, "toolset_snapshot_json", &session.ToolsetSnapshot); err != nil {
+		return Session{}, err
+	}
+	if err := decodeJSONField(record, "todo_json", &session.Todo); err != nil {
 		return Session{}, err
 	}
 	return session, nil
