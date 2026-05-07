@@ -19,6 +19,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
+	"github.com/jpconstantineau/Glaucus/internal/tools"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
 )
@@ -41,6 +42,7 @@ type Options struct {
 	EventService            *runtime.EventService
 	PromptBuilder           *runtime.PromptBuilder
 	Orchestrator            *runtime.Orchestrator
+	ToolRegistry            *tools.Registry
 	LoadedConfig            config.Config
 	DefaultOperatorEmail    string
 	DefaultOperatorPassword string
@@ -257,6 +259,7 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 	}
 
 	runID := strings.TrimSpace(e.Request.URL.Query().Get("run"))
+	selectedToolset := fallbackString(e.Request.URL.Query().Get("toolset"), m.defaultToolset())
 	data := chatPageData{
 		AppName:         m.options.AppName,
 		OperatorEmail:   operator.Email(),
@@ -266,7 +269,8 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 		Transcript:      transcript,
 		Models:          m.modelOptions(),
 		SelectedModel:   defaultModelRef(m.options.LoadedConfig),
-		SelectedToolset: "safe-default",
+		Toolsets:        m.toolsetOptions(),
+		SelectedToolset: selectedToolset,
 		ActiveRunID:     runID,
 		StreamURL:       "/api/dashboard/runs/" + url.PathEscape(runID) + "/stream",
 		TranscriptURL:   "/chat/transcript?session=" + url.QueryEscape(activeSessionID),
@@ -315,6 +319,7 @@ func (m *Module) chatSend(e *core.RequestEvent, _ *core.Record) error {
 		err     error
 	)
 	providerID, modelID := splitModelRef(modelRef, m.options.LoadedConfig)
+	toolResolution := m.resolveToolset(e.Request.Context(), fallbackString(toolsetRef, m.defaultToolset()))
 	if sessionID == "" {
 		session, err = m.options.SessionService.CreateSession(e.Request.Context(), sessions.CreateSessionInput{
 			ProfileID: profileID,
@@ -326,7 +331,10 @@ func (m *Module) chatSend(e *core.RequestEvent, _ *core.Record) error {
 				"model":    modelID,
 			},
 			ToolsetSnapshot: map[string]any{
-				"name": fallbackString(toolsetRef, "safe-default"),
+				"name":         fallbackString(toolsetRef, m.defaultToolset()),
+				"surface":      tools.SurfaceWebChat,
+				"tool_names":   toolResolution.ToolNames,
+				"availability": toolResolution.Availability,
 			},
 		})
 		if err != nil {
@@ -363,11 +371,13 @@ func (m *Module) chatSend(e *core.RequestEvent, _ *core.Record) error {
 	}
 
 	input := runtime.ExecuteRunInput{
-		ProfileID:     profileID,
-		SessionID:     session.ID,
-		TriggerSource: "web_chat",
-		UserMessageID: userMessage.ID,
-		Prompt:        promptDoc,
+		ProfileID:      profileID,
+		SessionID:      session.ID,
+		TriggerSource:  "web_chat",
+		UserMessageID:  userMessage.ID,
+		Surface:        tools.SurfaceWebChat,
+		ToolResolution: toolResolution,
+		Prompt:         promptDoc,
 		Request: providers.NormalizedRequest{
 			Messages:     []providers.RequestMessage{{Role: "user", Content: promptText}},
 			RequiredCaps: []string{"chat"},
@@ -671,6 +681,7 @@ type chatPageData struct {
 	ActiveSession   *sessions.Session
 	Transcript      []sessions.Message
 	Models          []modelOption
+	Toolsets        []string
 	SelectedModel   string
 	SelectedToolset string
 	ActiveRunID     string
@@ -873,8 +884,9 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
           </label>
           <label>Toolset
             <select name="toolset">
-              <option value="safe-default" selected>safe-default</option>
-              <option value="read-only">read-only</option>
+              {{range .Toolsets}}
+                <option value="{{.}}" {{if eq $.SelectedToolset .}}selected{{end}}>{{.}}</option>
+              {{end}}
             </select>
           </label>
         </div>
@@ -983,6 +995,43 @@ func (m *Module) modelOptions() []modelOption {
 		return options[i].Label < options[j].Label
 	})
 	return options
+}
+
+func (m *Module) toolsetOptions() []string {
+	if m.options.ToolRegistry == nil {
+		return []string{m.defaultToolset(), "read_only"}
+	}
+	names := m.options.ToolRegistry.ToolsetNames()
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		switch name {
+		case tools.SurfaceWebChat, "safe", "read_only", "file", "terminal", "web", "browser":
+			filtered = append(filtered, name)
+		}
+	}
+	if len(filtered) == 0 {
+		return []string{m.defaultToolset()}
+	}
+	return filtered
+}
+
+func (m *Module) defaultToolset() string {
+	return tools.SurfaceWebChat
+}
+
+func (m *Module) resolveToolset(ctx context.Context, name string) tools.Resolution {
+	if m.options.ToolRegistry == nil {
+		return tools.Resolution{
+			Surface:          tools.SurfaceWebChat,
+			RequestedToolset: name,
+		}
+	}
+	return m.options.ToolRegistry.Resolve(ctx, tools.ResolveRequest{
+		Surface:          tools.SurfaceWebChat,
+		RequestedToolset: name,
+		ProfileRoot:      m.options.Profile.Root,
+		WorkingDirectory: m.options.Profile.Root,
+	})
 }
 
 func splitModelRef(modelRef string, cfg config.Config) (string, string) {

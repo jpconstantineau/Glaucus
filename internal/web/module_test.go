@@ -15,6 +15,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
+	"github.com/jpconstantineau/Glaucus/internal/tools"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 	_ "github.com/pocketbase/pocketbase/migrations"
@@ -58,6 +59,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		EventService:            runtime.NewEventService(app),
 		PromptBuilder:           runtime.NewPromptBuilder(),
 		Orchestrator:            runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, config.Default()), runtime.NewEventService(app)),
+		ToolRegistry:            func() *tools.Registry { r := tools.NewRegistry(); tools.RegisterCatalogDefaults(r); return r }(),
 		LoadedConfig:            config.Default(),
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
@@ -208,6 +210,7 @@ func TestLoginPageReusesExistingCSRFCookie(t *testing.T) {
 		SessionTTL:      24 * time.Hour,
 		Profile:         profile.ActiveProfile{Slug: "default"},
 		ProviderCatalog: providers.Catalog{},
+		ToolRegistry:    func() *tools.Registry { r := tools.NewRegistry(); tools.RegisterCatalogDefaults(r); return r }(),
 	}}
 	module.BindRoutes(app, router)
 

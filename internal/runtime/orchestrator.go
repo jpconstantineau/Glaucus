@@ -9,6 +9,7 @@ import (
 
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
+	"github.com/jpconstantineau/Glaucus/internal/tools"
 )
 
 const (
@@ -24,6 +25,8 @@ type ExecuteRunInput struct {
 	SessionID        string
 	TriggerSource    string
 	UserMessageID    string
+	Surface          string
+	ToolResolution   tools.Resolution
 	Prompt           PromptDocument
 	Request          providers.NormalizedRequest
 	Resolution       providers.ResolutionInput
@@ -71,8 +74,10 @@ func (o *Orchestrator) QueueRun(ctx context.Context, input ExecuteRunInput) (ses
 		WorkingDirectory: input.WorkingDirectory,
 		Request: map[string]any{
 			"user_message_id":  input.UserMessageID,
+			"surface":          input.Surface,
 			"prompt":           RenderPrompt(input.Prompt),
 			"prompt_fragments": input.Prompt.Fragments,
+			"tool_selection":   input.ToolResolution,
 		},
 	})
 	if err != nil {

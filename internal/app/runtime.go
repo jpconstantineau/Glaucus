@@ -13,6 +13,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	agentruntime "github.com/jpconstantineau/Glaucus/internal/runtime"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
+	"github.com/jpconstantineau/Glaucus/internal/tools"
 	"github.com/jpconstantineau/Glaucus/internal/web"
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/apis"
@@ -38,6 +39,7 @@ type Runtime struct {
 	prompts    *agentruntime.PromptBuilder
 	router     *providers.Router
 	runs       *agentruntime.Orchestrator
+	tools      *tools.Registry
 	web        *web.Module
 	server     *pocketbaseService
 }
@@ -95,6 +97,8 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.events = agentruntime.NewEventService(pb)
 	runtime.prompts = agentruntime.NewPromptBuilder()
 	runtime.router = providers.NewRouter(catalog, loadedConfig.Config)
+	runtime.tools = tools.NewRegistry()
+	tools.RegisterCatalogDefaults(runtime.tools)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events)
 
 	sessionTTL, err := time.ParseDuration(loadedConfig.Config.Web.SessionTTL)
@@ -115,6 +119,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		EventService:            runtime.events,
 		PromptBuilder:           runtime.prompts,
 		Orchestrator:            runtime.runs,
+		ToolRegistry:            runtime.tools,
 		LoadedConfig:            loadedConfig.Config,
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
