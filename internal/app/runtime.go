@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/pocketbase/pocketbase"
 )
