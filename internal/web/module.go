@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
@@ -42,6 +43,7 @@ type Options struct {
 	EventService            *runtime.EventService
 	PromptBuilder           *runtime.PromptBuilder
 	Orchestrator            *runtime.Orchestrator
+	ApprovalService         *approvals.Service
 	ToolRegistry            *tools.Registry
 	LoadedConfig            config.Config
 	DefaultOperatorEmail    string
@@ -76,6 +78,9 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.POST("/logout", m.withOperatorAuth(m.logoutSubmit))
 	rg.GET("/dashboard", m.withOperatorAuth(m.dashboardShell))
 	rg.GET("/dashboard/status", m.withOperatorAuth(m.dashboardStatusPage))
+	rg.GET("/dashboard/approvals", m.withOperatorAuth(m.approvalsPage))
+	rg.POST("/dashboard/approvals/{approvalID}/decision", m.withOperatorAuth(m.approvalDecisionSubmit))
+	rg.GET("/dashboard/tools", m.withOperatorAuth(m.toolsPage))
 	rg.GET("/chat", m.withOperatorAuth(m.chatPage))
 	rg.GET("/chat/transcript", m.withOperatorAuth(m.chatTranscript))
 	rg.POST("/chat/send", m.withOperatorAuth(m.chatSend))
@@ -206,17 +211,19 @@ func (m *Module) dashboardShell(e *core.RequestEvent, operator *core.Record) err
 	}
 
 	data := struct {
-		AppName       string
-		OperatorEmail string
-		ProfileSlug   string
-		ProviderCount int
-		CSRF          string
+		AppName          string
+		OperatorEmail    string
+		ProfileSlug      string
+		ProviderCount    int
+		PendingApprovals int
+		CSRF             string
 	}{
-		AppName:       m.options.AppName,
-		OperatorEmail: operator.Email(),
-		ProfileSlug:   m.options.Profile.Slug,
-		ProviderCount: len(m.options.ProviderCatalog.Entries),
-		CSRF:          csrfToken,
+		AppName:          m.options.AppName,
+		OperatorEmail:    operator.Email(),
+		ProfileSlug:      m.options.Profile.Slug,
+		ProviderCount:    len(m.options.ProviderCatalog.Entries),
+		PendingApprovals: m.pendingApprovalCount(e.Request.Context()),
+		CSRF:             csrfToken,
 	}
 
 	return e.HTML(http.StatusOK, dashboardTemplate(data))
@@ -781,11 +788,16 @@ var dashboardPageTmpl = template.Must(template.New("dashboard").Parse(`<!doctype
         <div class="label">Health</div>
         <div class="value">OK</div>
       </article>
+      <article class="card">
+        <div class="label">Pending Approvals</div>
+        <div class="value">{{.PendingApprovals}}</div>
+      </article>
     </section>
     <section class="panel">
       <h2>Status</h2>
       <p>Open the operator status page at <a href="/dashboard/status">/dashboard/status</a>.</p>
       <p>Open the browser chat MVP at <a href="/chat">/chat</a>.</p>
+      <p>Review approval requests at <a href="/dashboard/approvals">/dashboard/approvals</a> and inspect effective tool availability at <a href="/dashboard/tools">/dashboard/tools</a>.</p>
       <p>Machine-readable endpoints: <a href="/health">/health</a>, <a href="/health/detailed">/health/detailed</a>, <a href="/api/version">/api/version</a>.</p>
     </section>
   </main>
@@ -908,6 +920,11 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         </div>
       </form>
       <section class="stream">
+        <strong>Tool Activity</strong>
+        <div class="hint">Tool calls, approval requests, and results stream into this rail for the active run.</div>
+        <pre id="tool-activity"></pre>
+      </section>
+      <section class="stream">
         <strong>Streaming Output</strong>
         <div class="hint">Run events feed the panel below while the transcript persists on the server.</div>
         <pre id="live-output"></pre>
@@ -924,8 +941,16 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
       if (!runId) return;
 
       const live = document.getElementById("live-output");
+      const activity = document.getElementById("tool-activity");
       const transcript = document.getElementById("transcript");
       const source = new EventSource({{printf "%q" .StreamURL}});
+      ["tool.started", "tool.completed", "tool.failed", "tool.approval_requested", "tool.approval_denied"].forEach(function (name) {
+        source.addEventListener(name, function (event) {
+          const payload = JSON.parse(event.data);
+          const details = payload.payload || {};
+          activity.textContent += "[" + name + "] " + JSON.stringify(details) + "\n";
+        });
+      });
       source.addEventListener("assistant.delta", function (event) {
         const payload = JSON.parse(event.data);
         live.textContent += (payload.payload && payload.payload.text) ? payload.payload.text : "";
@@ -1078,6 +1103,88 @@ func fallbackString(value, fallback string) string {
 	return fallback
 }
 
+type approvalsPageData struct {
+	AppName  string
+	CSRF     string
+	Requests []approvals.Request
+}
+
+type toolsPageData struct {
+	AppName  string
+	WebChat  tools.Resolution
+	WebAdmin tools.Resolution
+}
+
+func (m *Module) approvalsPage(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.ApprovalService == nil {
+		return e.InternalServerError("approval service unavailable", nil)
+	}
+	csrfToken, err := ensureCSRFCookie(e)
+	if err != nil {
+		return e.InternalServerError("failed to create approval form", err)
+	}
+	requests, err := m.options.ApprovalService.ListRecent(e.Request.Context(), m.options.Profile.Slug, 50)
+	if err != nil {
+		return e.InternalServerError("failed to load approvals", err)
+	}
+	return e.HTML(http.StatusOK, approvalsTemplate(approvalsPageData{
+		AppName:  m.options.AppName,
+		CSRF:     csrfToken,
+		Requests: requests,
+	}))
+}
+
+func (m *Module) approvalDecisionSubmit(e *core.RequestEvent, operator *core.Record) error {
+	if m.options.ApprovalService == nil {
+		return e.InternalServerError("approval service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+
+	approvalID := e.Request.PathValue("approvalID")
+	action := strings.TrimSpace(e.Request.FormValue("decision_action"))
+	decision := "deny"
+	scope := "blocked"
+	switch action {
+	case "allow_once":
+		decision = "allow"
+		scope = "once"
+	case "allow_session":
+		decision = "allow"
+		scope = "session"
+	case "allow_permanent":
+		decision = "allow"
+		scope = "permanent"
+	}
+	if _, err := m.options.ApprovalService.Decide(e.Request.Context(), approvalID, decision, scope, operator.Email()); err != nil {
+		return e.InternalServerError("failed to save approval decision", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/approvals")
+}
+
+func (m *Module) toolsPage(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.ToolRegistry == nil {
+		return e.InternalServerError("tool registry unavailable", nil)
+	}
+	return e.HTML(http.StatusOK, toolsTemplate(toolsPageData{
+		AppName:  m.options.AppName,
+		WebChat:  m.options.ToolRegistry.Resolve(e.Request.Context(), tools.ResolveRequest{Surface: tools.SurfaceWebChat, ProfileRoot: m.options.Profile.Root, WorkingDirectory: m.options.Profile.Root}),
+		WebAdmin: m.options.ToolRegistry.Resolve(e.Request.Context(), tools.ResolveRequest{Surface: tools.SurfaceWebAdmin, ProfileRoot: m.options.Profile.Root, WorkingDirectory: m.options.Profile.Root}),
+	}))
+}
+
+func (m *Module) pendingApprovalCount(ctx context.Context) int {
+	if m.options.ApprovalService == nil {
+		return 0
+	}
+	requests, err := m.options.ApprovalService.ListPending(ctx, m.options.Profile.Slug)
+	if err != nil {
+		return 0
+	}
+	return len(requests)
+}
+
 func parseToolPrompt(prompt string) (*tools.Invocation, error) {
 	trimmed := strings.TrimSpace(prompt)
 	if !strings.HasPrefix(trimmed, "/tool ") {
@@ -1106,4 +1213,95 @@ func parseToolPrompt(prompt string) (*tools.Invocation, error) {
 		Name:      name,
 		Arguments: args,
 	}, nil
+}
+
+var approvalsPageTmpl = template.Must(template.New("approvals").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Approvals</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 68rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    .request { border: 1px solid #d9e2ec; border-radius: .85rem; padding: 1rem; margin-top: 1rem; }
+    .meta { color: #52606d; font-size: .9rem; }
+    form { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .75rem; }
+    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
+    .deny { background: #b42318; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Approvals Queue</h1>
+    <p><a href="/dashboard">Back to dashboard</a></p>
+    {{if .Requests}}
+      {{range .Requests}}
+        <article class="request">
+          <strong>{{.ToolName}}</strong>
+          <div class="meta">Decision: {{if .Decision}}{{.Decision}}{{else}}pending{{end}} · Scope: {{if .Scope}}{{.Scope}}{{else}}pending{{end}}</div>
+          <pre>{{index .Request "summary"}}</pre>
+          {{if eq .Decision "pending"}}
+            <form method="post" action="/dashboard/approvals/{{.ID}}/decision">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <button type="submit" name="decision_action" value="allow_once">Allow Once</button>
+              <button type="submit" name="decision_action" value="allow_session">Allow Session</button>
+              <button type="submit" name="decision_action" value="allow_permanent">Allow Permanent</button>
+              <button type="submit" class="deny" name="decision_action" value="deny">Deny</button>
+            </form>
+          {{end}}
+        </article>
+      {{end}}
+    {{else}}
+      <p>No approval requests yet.</p>
+    {{end}}
+  </section>
+</body>
+</html>`))
+
+var toolsPageTmpl = template.Must(template.New("tools").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Tools</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 68rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    .tool { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
+    .meta { color: #52606d; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Tool Availability</h1>
+    <p><a href="/dashboard">Back to dashboard</a></p>
+    <h2>Web Chat</h2>
+    {{range .WebChat.EnabledTools}}
+      <article class="tool"><strong>{{.Definition.Name}}</strong><div class="meta">{{.Definition.Description}}</div></article>
+    {{end}}
+    {{range .WebChat.UnavailableTools}}
+      <article class="tool"><strong>{{.Definition.Name}}</strong><div class="meta">{{.Availability.Reason}}</div></article>
+    {{end}}
+    <h2>Web Admin</h2>
+    {{range .WebAdmin.EnabledTools}}
+      <article class="tool"><strong>{{.Definition.Name}}</strong><div class="meta">{{.Definition.Description}}</div></article>
+    {{end}}
+    {{range .WebAdmin.UnavailableTools}}
+      <article class="tool"><strong>{{.Definition.Name}}</strong><div class="meta">{{.Availability.Reason}}</div></article>
+    {{end}}
+  </section>
+</body>
+</html>`))
+
+func approvalsTemplate(data approvalsPageData) string {
+	var sb strings.Builder
+	_ = approvalsPageTmpl.Execute(&sb, data)
+	return sb.String()
+}
+
+func toolsTemplate(data toolsPageData) string {
+	var sb strings.Builder
+	_ = toolsPageTmpl.Execute(&sb, data)
+	return sb.String()
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -153,6 +154,30 @@ func (s *Service) ListPending(ctx context.Context, profileID string) ([]Request,
 			return nil, err
 		}
 		requests = append(requests, request)
+	}
+	_ = ctx
+	return requests, nil
+}
+
+func (s *Service) ListRecent(ctx context.Context, profileID string, limit int) ([]Request, error) {
+	records, err := s.app.FindRecordsByFilter(CollectionApprovalRequests, "profile_id = {:profile_id}", "", 0, 0, dbx.Params{"profile_id": profileID})
+	if err != nil {
+		return nil, fmt.Errorf("list approval history: %w", err)
+	}
+
+	requests := make([]Request, 0, len(records))
+	for _, record := range records {
+		request, err := requestFromRecord(record)
+		if err != nil {
+			return nil, err
+		}
+		requests = append(requests, request)
+	}
+	sort.SliceStable(requests, func(i, j int) bool {
+		return requests[i].CreatedAt.After(requests[j].CreatedAt)
+	})
+	if limit > 0 && len(requests) > limit {
+		requests = requests[:limit]
 	}
 	_ = ctx
 	return requests, nil

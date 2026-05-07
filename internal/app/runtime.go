@@ -125,6 +125,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		EventService:            runtime.events,
 		PromptBuilder:           runtime.prompts,
 		Orchestrator:            runtime.runs,
+		ApprovalService:         approvalService,
 		ToolRegistry:            runtime.tools,
 		LoadedConfig:            loadedConfig.Config,
 		DefaultOperatorEmail:    "admin@glaucus.local",

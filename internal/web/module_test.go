@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
@@ -40,6 +41,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	if err := EnsureDefaultOperator(app, "admin@glaucus.local", "glaucus-admin"); err != nil {
 		t.Fatalf("ensure operator: %v", err)
 	}
+	approvalService := approvals.NewService(app, config.Default().Approvals)
 
 	router, err := apis.NewRouter(app)
 	if err != nil {
@@ -64,6 +66,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 			tools.RegisterFileTools(r)
 			return r
 		}(), nil),
+		ApprovalService: approvalService,
 		ToolRegistry: func() *tools.Registry {
 			r := tools.NewRegistry()
 			tools.RegisterCatalogDefaults(r)
@@ -138,6 +141,9 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	if !strings.Contains(dashboardRes.Body.String(), "Providers") {
 		t.Fatal("expected dashboard to render provider card")
 	}
+	if !strings.Contains(dashboardRes.Body.String(), "Pending Approvals") {
+		t.Fatal("expected dashboard to render approvals card")
+	}
 
 	detailedReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/health/detailed", nil)
 	detailedReq.Host = "127.0.0.1:8090"
@@ -183,6 +189,9 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	}
 	if !strings.Contains(chatRes.Body.String(), "Send Prompt") || !strings.Contains(chatRes.Body.String(), "Streaming Output") {
 		t.Fatalf("expected chat page to render MVP controls, got %s", chatRes.Body.String())
+	}
+	if !strings.Contains(chatRes.Body.String(), "Tool Activity") {
+		t.Fatalf("expected chat page to render tool activity rail, got %s", chatRes.Body.String())
 	}
 }
 
@@ -290,5 +299,105 @@ func TestParseToolPrompt(t *testing.T) {
 	}
 	if invocation.Arguments["path"] != "SOUL.md" {
 		t.Fatalf("expected path argument, got %+v", invocation.Arguments)
+	}
+}
+
+func TestApprovalsPageRendersPendingRequest(t *testing.T) {
+	app := core.NewBaseApp(core.BaseAppConfig{
+		DataDir:       t.TempDir(),
+		EncryptionEnv: "GLAUCUS_TEST_ENCRYPTION_KEY",
+	})
+	t.Setenv("GLAUCUS_TEST_ENCRYPTION_KEY", "12345678901234567890123456789012")
+	t.Cleanup(func() {
+		_ = app.ResetBootstrapState()
+	})
+
+	if err := app.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap app: %v", err)
+	}
+	if err := app.RunAllMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	if err := EnsureDefaultOperator(app, "admin@glaucus.local", "glaucus-admin"); err != nil {
+		t.Fatalf("ensure operator: %v", err)
+	}
+
+	router, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatalf("new router: %v", err)
+	}
+
+	approvalService := approvals.NewService(app, config.Default().Approvals)
+	if _, err := approvalService.Evaluate(t.Context(), approvals.EvaluationInput{
+		ProfileID: "default",
+		SessionID: "session_1",
+		RunID:     "run_1",
+		ToolName:  "write_file",
+		ToolDefinition: tools.ToolDefinition{
+			Name:  "write_file",
+			Flags: tools.ToolFlags{ApprovalSensitive: true},
+		},
+		Arguments: map[string]any{"path": "docs/test.txt"},
+	}); err != nil {
+		t.Fatalf("create pending approval: %v", err)
+	}
+
+	module := &Module{options: Options{
+		AppName:         "Glaucus",
+		BindAddress:     "127.0.0.1:8090",
+		SessionTTL:      24 * time.Hour,
+		Profile:         profile.ActiveProfile{Slug: "default"},
+		ApprovalService: approvalService,
+		ToolRegistry: func() *tools.Registry {
+			r := tools.NewRegistry()
+			tools.RegisterCatalogDefaults(r)
+			tools.RegisterFileTools(r)
+			return r
+		}(),
+	}}
+	module.BindRoutes(app, router)
+
+	mux, err := router.BuildMux()
+	if err != nil {
+		t.Fatalf("build mux: %v", err)
+	}
+
+	loginPageReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/login", nil)
+	loginPageReq.Host = "127.0.0.1:8090"
+	loginPageRes := httptest.NewRecorder()
+	mux.ServeHTTP(loginPageRes, loginPageReq)
+	csrfCookie := loginPageRes.Result().Cookies()[0]
+	csrfToken := extractValue(loginPageRes.Body.String(), `name="csrf" value="`, `"`)
+
+	form := url.Values{
+		"csrf":     {csrfToken},
+		"email":    {"admin@glaucus.local"},
+		"password": {"glaucus-admin"},
+	}
+	loginReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8090/login", strings.NewReader(form.Encode()))
+	loginReq.Host = "127.0.0.1:8090"
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginReq.AddCookie(csrfCookie)
+	loginRes := httptest.NewRecorder()
+	mux.ServeHTTP(loginRes, loginReq)
+
+	var sessionCookie *http.Cookie
+	for _, cookie := range loginRes.Result().Cookies() {
+		if cookie.Name == sessionCookieName {
+			sessionCookie = cookie
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/dashboard/approvals", nil)
+	req.Host = "127.0.0.1:8090"
+	req.AddCookie(sessionCookie)
+	req.AddCookie(csrfCookie)
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200 from approvals page, got %d", res.Code)
+	}
+	if !strings.Contains(res.Body.String(), "Approvals Queue") || !strings.Contains(res.Body.String(), "write_file") {
+		t.Fatalf("expected approvals page to show pending request, got %s", res.Body.String())
 	}
 }
