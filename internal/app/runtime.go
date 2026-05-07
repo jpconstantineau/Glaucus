@@ -10,10 +10,12 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/memory"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	agentruntime "github.com/jpconstantineau/Glaucus/internal/runtime"
+	"github.com/jpconstantineau/Glaucus/internal/search"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
 	"github.com/jpconstantineau/Glaucus/internal/tools"
 	"github.com/jpconstantineau/Glaucus/internal/web"
@@ -38,6 +40,8 @@ type Runtime struct {
 	providers  providers.Catalog
 	sessions   *sessions.Service
 	jobs       *jobs.Service
+	memory     *memory.Service
+	search     *search.Service
 	scheduler  *jobs.Scheduler
 	events     *agentruntime.EventService
 	prompts    *agentruntime.PromptBuilder
@@ -99,8 +103,10 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	}
 	runtime.sessions = sessions.NewService(pb)
 	runtime.jobs = jobs.NewService(pb)
+	runtime.memory = memory.NewService(pb)
 	runtime.events = agentruntime.NewEventService(pb)
 	runtime.prompts = agentruntime.NewPromptBuilder()
+	runtime.search = search.NewService(pb, runtime.sessions)
 	runtime.router = providers.NewRouter(catalog, loadedConfig.Config)
 	runtime.tools = tools.NewRegistry()
 	tools.RegisterCatalogDefaults(runtime.tools)
@@ -109,6 +115,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	tools.RegisterProcessTools(runtime.tools, processService)
 	tools.RegisterWebTools(runtime.tools, tools.NewHTTPWebBackend(), nil)
 	tools.RegisterJobTools(runtime.tools, jobToolAdapter{service: runtime.jobs})
+	tools.RegisterPlanningTools(runtime.tools, todoToolAdapter{service: runtime.sessions}, memoryToolAdapter{service: runtime.memory, profileRoot: activeProfile.Root}, searchToolAdapter{service: runtime.search})
 	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
 	pollInterval, err := time.ParseDuration(loadedConfig.Config.Cron.PollInterval)

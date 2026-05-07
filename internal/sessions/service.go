@@ -35,6 +35,7 @@ type Session struct {
 	Status          string
 	ModelSnapshot   map[string]any
 	ToolsetSnapshot map[string]any
+	Todo            []map[string]any
 	LastMessageAt   time.Time
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
@@ -82,6 +83,7 @@ type CreateSessionInput struct {
 	Status          string
 	ModelSnapshot   map[string]any
 	ToolsetSnapshot map[string]any
+	Todo            []map[string]any
 }
 
 type CreateMessageInput struct {
@@ -158,6 +160,9 @@ func (s *Service) CreateSession(ctx context.Context, input CreateSessionInput) (
 	if err := setJSON(record, "toolset_snapshot_json", input.ToolsetSnapshot); err != nil {
 		return Session{}, err
 	}
+	if err := setJSON(record, "todo_json", input.Todo); err != nil {
+		return Session{}, err
+	}
 
 	if err := s.app.SaveWithContext(ctx, record); err != nil {
 		return Session{}, fmt.Errorf("save session: %w", err)
@@ -202,6 +207,20 @@ func (s *Service) ListSessions(ctx context.Context, profileID string, limit int)
 
 	_ = ctx
 	return sessions, nil
+}
+
+func (s *Service) ReplaceSessionTodo(ctx context.Context, sessionID string, items []map[string]any) (Session, error) {
+	record, err := s.app.FindRecordById(CollectionSessions, sessionID)
+	if err != nil {
+		return Session{}, fmt.Errorf("find session: %w", err)
+	}
+	if err := setJSON(record, "todo_json", items); err != nil {
+		return Session{}, err
+	}
+	if err := s.app.SaveWithContext(ctx, record); err != nil {
+		return Session{}, fmt.Errorf("update session todo: %w", err)
+	}
+	return sessionFromRecord(record)
 }
 
 func (s *Service) CreateMessage(ctx context.Context, input CreateMessageInput) (Message, error) {
@@ -510,6 +529,9 @@ func sessionFromRecord(record *core.Record) (Session, error) {
 		return Session{}, err
 	}
 	if err := decodeJSONField(record, "toolset_snapshot_json", &session.ToolsetSnapshot); err != nil {
+		return Session{}, err
+	}
+	if err := decodeJSONField(record, "todo_json", &session.Todo); err != nil {
 		return Session{}, err
 	}
 	return session, nil
