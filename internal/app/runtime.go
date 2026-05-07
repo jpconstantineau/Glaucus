@@ -9,6 +9,7 @@ import (
 
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/memory"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
@@ -44,6 +45,7 @@ type Runtime struct {
 	memory     *memory.Service
 	search     *search.Service
 	skills     *skills.Service
+	exports    *exportsvc.Service
 	curator    *skills.Curator
 	scheduler  *jobs.Scheduler
 	events     *agentruntime.EventService
@@ -111,6 +113,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.prompts = agentruntime.NewPromptBuilder()
 	runtime.search = search.NewService(pb, runtime.sessions)
 	runtime.skills = skills.NewService(pb)
+	runtime.exports = exportsvc.NewService(pb)
 	runtime.router = providers.NewRouter(catalog, loadedConfig.Config)
 	runtime.tools = tools.NewRegistry()
 	tools.RegisterCatalogDefaults(runtime.tools)
