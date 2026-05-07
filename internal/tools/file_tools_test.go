@@ -74,7 +74,7 @@ func TestWriteAndPatchToolsStayWithinApprovedRoots(t *testing.T) {
 		ProfileRoot:      root,
 		WorkingDirectory: root,
 		Arguments: map[string]any{
-			"path":    "..\\escape.txt",
+			"path":    filepath.Join("..", "escape.txt"),
 			"content": "nope",
 		},
 	})
