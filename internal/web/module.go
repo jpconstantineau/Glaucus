@@ -125,18 +125,10 @@ func (m *Module) loginPage(e *core.RequestEvent) error {
 		return err
 	}
 
-	csrfToken, err := randomToken()
+	csrfToken, err := ensureCSRFCookie(e)
 	if err != nil {
 		return e.InternalServerError("failed to create login form", err)
 	}
-
-	http.SetCookie(e.Response, &http.Cookie{
-		Name:     csrfCookieName,
-		Value:    csrfToken,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
 
 	data := struct {
 		AppName              string

@@ -180,6 +180,75 @@ func TestInvalidHostIsRejected(t *testing.T) {
 	}
 }
 
+func TestLoginPageReusesExistingCSRFCookie(t *testing.T) {
+	app := core.NewBaseApp(core.BaseAppConfig{
+		DataDir:       t.TempDir(),
+		EncryptionEnv: "GLAUCUS_TEST_ENCRYPTION_KEY",
+	})
+	t.Setenv("GLAUCUS_TEST_ENCRYPTION_KEY", "12345678901234567890123456789012")
+	t.Cleanup(func() {
+		_ = app.ResetBootstrapState()
+	})
+
+	if err := app.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap app: %v", err)
+	}
+	if err := app.RunAllMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	router, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatalf("new router: %v", err)
+	}
+
+	module := &Module{options: Options{
+		AppName:         "Glaucus",
+		BindAddress:     "127.0.0.1:8090",
+		SessionTTL:      24 * time.Hour,
+		Profile:         profile.ActiveProfile{Slug: "default"},
+		ProviderCatalog: providers.Catalog{},
+	}}
+	module.BindRoutes(app, router)
+
+	mux, err := router.BuildMux()
+	if err != nil {
+		t.Fatalf("build mux: %v", err)
+	}
+
+	firstReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/login", nil)
+	firstReq.Host = "127.0.0.1:8090"
+	firstRes := httptest.NewRecorder()
+	mux.ServeHTTP(firstRes, firstReq)
+	if firstRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 from first /login, got %d", firstRes.Code)
+	}
+
+	firstCookie := firstRes.Result().Cookies()[0]
+	firstToken := extractValue(firstRes.Body.String(), `name="csrf" value="`, `"`)
+	if firstToken == "" {
+		t.Fatal("expected first login form csrf token")
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/login", nil)
+	secondReq.Host = "127.0.0.1:8090"
+	secondReq.AddCookie(firstCookie)
+	secondRes := httptest.NewRecorder()
+	mux.ServeHTTP(secondRes, secondReq)
+	if secondRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 from second /login, got %d", secondRes.Code)
+	}
+
+	secondToken := extractValue(secondRes.Body.String(), `name="csrf" value="`, `"`)
+	if secondToken != firstToken {
+		t.Fatalf("expected csrf token reuse, got first=%q second=%q", firstToken, secondToken)
+	}
+
+	if len(secondRes.Result().Cookies()) != 0 {
+		t.Fatalf("expected no replacement csrf cookie when one already exists, got %d cookies", len(secondRes.Result().Cookies()))
+	}
+}
+
 func extractValue(body, prefix, suffix string) string {
 	start := strings.Index(body, prefix)
 	if start == -1 {
