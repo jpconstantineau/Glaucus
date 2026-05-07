@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -79,5 +81,33 @@ func TestLifecycleStopsStartedServicesWhenStartupFails(t *testing.T) {
 func TestNewRuntimeRequiresName(t *testing.T) {
 	if _, err := NewRuntime(RuntimeOptions{}); err == nil {
 		t.Fatal("expected runtime creation to fail without a name")
+	}
+}
+
+func TestNewRuntimeBootstrapsProfileAndLoadsConfig(t *testing.T) {
+	profilesDir := t.TempDir()
+	profileRoot := filepath.Join(profilesDir, "operator")
+
+	if err := os.MkdirAll(profileRoot, 0o755); err != nil {
+		t.Fatalf("create profile root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(profileRoot, "config.yaml"), []byte("model:\n  defaultProvider: test-provider\n  defaultModel: test-model\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	runtime, err := NewRuntime(RuntimeOptions{
+		Name:        "Glaucus",
+		ProfilesDir: profilesDir,
+		ProfileSlug: "operator",
+	})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+
+	if runtime.profile.Slug != "operator" {
+		t.Fatalf("expected operator profile, got %q", runtime.profile.Slug)
+	}
+	if runtime.config.Config.Model.DefaultProvider != "test-provider" {
+		t.Fatalf("expected provider override, got %q", runtime.config.Config.Model.DefaultProvider)
 	}
 }
