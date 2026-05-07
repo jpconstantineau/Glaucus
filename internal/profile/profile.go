@@ -61,7 +61,7 @@ func Bootstrap(opts BootstrapOptions) (ActiveProfile, error) {
 	}
 
 	files := map[string]string{
-		filepath.Join(profile.Root, "config.yaml"):           "",
+		filepath.Join(profile.Root, "config.yaml"):           defaultConfigYAML(),
 		filepath.Join(profile.Root, ".env"):                  "",
 		filepath.Join(profile.Root, "SOUL.md"):               "# Glaucus\n",
 		filepath.Join(profile.Root, "memories", "MEMORY.md"): "# Memory\n",
@@ -116,4 +116,22 @@ func ensureFile(path, content string) error {
 	}
 
 	return nil
+}
+
+func defaultConfigYAML() string {
+	return `model:
+  defaultProvider: ollama-local
+  defaultModel: llama3.2:3b
+
+providers:
+  ollama-local:
+    baseURL: http://127.0.0.1:11434/v1
+    dialect: openai-chat
+
+web:
+  bindAddress: 127.0.0.1:8090
+
+pocketbase:
+  dataDir: pb_data
+`
 }
