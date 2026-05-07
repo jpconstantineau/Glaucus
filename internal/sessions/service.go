@@ -112,6 +112,7 @@ type CreateRunInput struct {
 }
 
 type UpdateRunInput struct {
+	StartedAt          time.Time
 	Status             string
 	ProviderResolution map[string]any
 	EndedAt            time.Time
@@ -374,6 +375,13 @@ func (s *Service) UpdateRun(ctx context.Context, runID string, input UpdateRunIn
 
 	if strings.TrimSpace(input.Status) != "" {
 		record.Set("status", input.Status)
+	}
+	if !input.StartedAt.IsZero() {
+		dt, err := types.ParseDateTime(input.StartedAt)
+		if err != nil {
+			return Run{}, fmt.Errorf("parse started_at: %w", err)
+		}
+		record.Set("started_at", dt)
 	}
 	if !input.EndedAt.IsZero() {
 		dt, err := types.ParseDateTime(input.EndedAt)
