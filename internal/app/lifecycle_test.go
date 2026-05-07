@@ -94,11 +94,20 @@ func TestNewRuntimeBootstrapsProfileAndLoadsConfig(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(profileRoot, "config.yaml"), []byte("model:\n  defaultProvider: test-provider\n  defaultModel: test-model\n"), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
+	providersDir := filepath.Join(t.TempDir(), "manifests")
+	if err := os.MkdirAll(providersDir, 0o755); err != nil {
+		t.Fatalf("create provider dir: %v", err)
+	}
+	manifest := []byte("providerId: test-provider\ndisplayName: Test Provider\nfamily: openai-compatible\nbaseURL: http://localhost:11434/v1\ndialect: openai-chat\nmodels:\n  - providerModelId: test-model\n    displayName: Test Model\n    capabilities: [chat]\n    lifecycleStatus: ga\n")
+	if err := os.WriteFile(filepath.Join(providersDir, "test-provider.yaml"), manifest, 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
 
 	runtime, err := NewRuntime(RuntimeOptions{
-		Name:        "Glaucus",
-		ProfilesDir: profilesDir,
-		ProfileSlug: "operator",
+		Name:         "Glaucus",
+		ProfilesDir:  profilesDir,
+		ProfileSlug:  "operator",
+		ProvidersDir: providersDir,
 	})
 	if err != nil {
 		t.Fatalf("new runtime: %v", err)
@@ -109,5 +118,8 @@ func TestNewRuntimeBootstrapsProfileAndLoadsConfig(t *testing.T) {
 	}
 	if runtime.config.Config.Model.DefaultProvider != "test-provider" {
 		t.Fatalf("expected provider override, got %q", runtime.config.Config.Model.DefaultProvider)
+	}
+	if len(runtime.providers.Entries) != 1 {
+		t.Fatalf("expected one provider entry, got %d", len(runtime.providers.Entries))
 	}
 }

@@ -1,0 +1,15 @@
+providerId: ollama-lan
+displayName: LAN Ollama
+family: ollama
+baseURL: http://192.168.1.10:11434/v1
+dialect: openai-chat
+models:
+  - providerModelId: qwen2.5-coder
+    displayName: Qwen 2.5 Coder
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 32768
+      maxOutputTokens: 4096

@@ -9,13 +9,15 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
+	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/pocketbase/pocketbase"
 )
 
 type RuntimeOptions struct {
-	Name        string
-	ProfilesDir string
-	ProfileSlug string
+	Name         string
+	ProfilesDir  string
+	ProfileSlug  string
+	ProvidersDir string
 }
 
 type Runtime struct {
@@ -24,6 +26,7 @@ type Runtime struct {
 	lifecycle  *Lifecycle
 	profile    profile.ActiveProfile
 	config     config.Loaded
+	providers  providers.Catalog
 }
 
 func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
@@ -35,6 +38,9 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	}
 	if opts.ProfileSlug == "" {
 		opts.ProfileSlug = "default"
+	}
+	if opts.ProvidersDir == "" {
+		opts.ProvidersDir = filepath.Join("providers", "manifests")
 	}
 
 	activeProfile, err := profile.Bootstrap(profile.BootstrapOptions{
@@ -48,6 +54,11 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	loadedConfig, err := config.Load(activeProfile.Root, config.FlagOverrides{})
 	if err != nil {
 		return nil, fmt.Errorf("load profile config: %w", err)
+	}
+
+	catalog, err := providers.LoadCatalog(opts.ProvidersDir)
+	if err != nil {
+		return nil, fmt.Errorf("load provider catalog: %w", err)
 	}
 
 	dataDir := loadedConfig.Config.PocketBase.DataDir
@@ -65,6 +76,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		lifecycle:  NewLifecycle(),
 		profile:    activeProfile,
 		config:     loadedConfig,
+		providers:  catalog,
 	}
 
 	runtime.lifecycle.Add(&pocketbaseService{app: pb})
