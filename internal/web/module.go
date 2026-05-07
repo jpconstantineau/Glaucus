@@ -10,16 +10,22 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
+	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
+	"github.com/jpconstantineau/Glaucus/internal/search"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
+	"github.com/jpconstantineau/Glaucus/internal/skills"
 	"github.com/jpconstantineau/Glaucus/internal/tools"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
@@ -40,6 +46,11 @@ type Options struct {
 	Profile                 profile.ActiveProfile
 	ProviderCatalog         providers.Catalog
 	SessionService          *sessions.Service
+	JobService              *jobs.Service
+	SearchService           *search.Service
+	SkillsService           *skills.Service
+	ExportService           *exportsvc.Service
+	Scheduler               *jobs.Scheduler
 	EventService            *runtime.EventService
 	PromptBuilder           *runtime.PromptBuilder
 	Orchestrator            *runtime.Orchestrator
@@ -78,6 +89,13 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.POST("/logout", m.withOperatorAuth(m.logoutSubmit))
 	rg.GET("/dashboard", m.withOperatorAuth(m.dashboardShell))
 	rg.GET("/dashboard/status", m.withOperatorAuth(m.dashboardStatusPage))
+	rg.GET("/dashboard/sessions", m.withOperatorAuth(m.sessionsPage))
+	rg.GET("/dashboard/runs/{runID}", m.withOperatorAuth(m.runDetailPage))
+	rg.GET("/dashboard/jobs", m.withOperatorAuth(m.jobsPage))
+	rg.POST("/dashboard/jobs/{jobID}/{action}", m.withOperatorAuth(m.jobActionSubmit))
+	rg.GET("/dashboard/skills", m.withOperatorAuth(m.skillsPage))
+	rg.POST("/dashboard/skills/{slug}/{action}", m.withOperatorAuth(m.skillActionSubmit))
+	rg.GET("/dashboard/logs", m.withOperatorAuth(m.logsPage))
 	rg.GET("/dashboard/approvals", m.withOperatorAuth(m.approvalsPage))
 	rg.POST("/dashboard/approvals/{approvalID}/decision", m.withOperatorAuth(m.approvalDecisionSubmit))
 	rg.GET("/dashboard/tools", m.withOperatorAuth(m.toolsPage))
@@ -421,10 +439,12 @@ func (m *Module) dashboardStatusPage(e *core.RequestEvent, operator *core.Record
 		OperatorEmail string
 		BindAddress   string
 		ProviderCount int
+		Scheduler     jobs.SchedulerStatus
 	}{
 		OperatorEmail: operator.Email(),
 		BindAddress:   m.options.BindAddress,
 		ProviderCount: len(m.options.ProviderCatalog.Entries),
+		Scheduler:     m.schedulerStatus(),
 	}
 
 	return e.HTML(http.StatusOK, statusTemplate(data))
@@ -439,7 +459,193 @@ func (m *Module) detailedHealth(e *core.RequestEvent, operator *core.Record) err
 		"providers":      len(m.options.ProviderCatalog.Entries),
 		"operator_email": operator.Email(),
 		"version":        m.options.Version,
+		"scheduler":      m.schedulerStatus(),
 	})
+}
+
+func (m *Module) sessionsPage(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.SessionService == nil {
+		return e.InternalServerError("session service unavailable", nil)
+	}
+	query := strings.TrimSpace(e.Request.URL.Query().Get("q"))
+	sessionList, err := m.options.SessionService.ListSessions(e.Request.Context(), m.options.Profile.Slug, 100)
+	if err != nil {
+		return e.InternalServerError("failed to list sessions", err)
+	}
+	searchResults := []search.Result{}
+	if query != "" && m.options.SearchService != nil {
+		searchResults, err = m.options.SearchService.SearchSessions(e.Request.Context(), m.options.Profile.Slug, query, 20)
+		if err != nil {
+			return e.InternalServerError("failed to search sessions", err)
+		}
+	}
+	return e.HTML(http.StatusOK, sessionsTemplate(struct {
+		AppName string
+		Query   string
+		List    []sessions.Session
+		Search  []search.Result
+	}{
+		AppName: m.options.AppName,
+		Query:   query,
+		List:    sessionList,
+		Search:  searchResults,
+	}))
+}
+
+func (m *Module) runDetailPage(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.SessionService == nil || m.options.EventService == nil {
+		return e.InternalServerError("run detail unavailable", nil)
+	}
+	runID := e.Request.PathValue("runID")
+	run, err := m.options.SessionService.GetRun(e.Request.Context(), runID)
+	if err != nil {
+		return e.InternalServerError("failed to load run", err)
+	}
+	events, err := m.options.EventService.ListRunEvents(e.Request.Context(), runID, 0)
+	if err != nil {
+		return e.InternalServerError("failed to load run events", err)
+	}
+	return e.HTML(http.StatusOK, runDetailTemplate(struct {
+		AppName string
+		Run     sessions.Run
+		Events  []runtime.RunEvent
+	}{
+		AppName: m.options.AppName,
+		Run:     run,
+		Events:  events,
+	}))
+}
+
+func (m *Module) jobsPage(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.JobService == nil {
+		return e.InternalServerError("job service unavailable", nil)
+	}
+	jobList, err := m.options.JobService.ListJobs(e.Request.Context(), m.options.Profile.Slug, 100)
+	if err != nil {
+		return e.InternalServerError("failed to list jobs", err)
+	}
+	selectedJobID := strings.TrimSpace(e.Request.URL.Query().Get("job"))
+	history := []jobs.JobRun{}
+	if selectedJobID != "" {
+		history, err = m.options.JobService.ListRuns(e.Request.Context(), selectedJobID, 25)
+		if err != nil {
+			return e.InternalServerError("failed to load job history", err)
+		}
+	}
+	return e.HTML(http.StatusOK, jobsTemplate(struct {
+		AppName string
+		Jobs    []jobs.Job
+		History []jobs.JobRun
+	}{
+		AppName: m.options.AppName,
+		Jobs:    jobList,
+		History: history,
+	}))
+}
+
+func (m *Module) jobActionSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.JobService == nil {
+		return e.InternalServerError("job service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	jobID := e.Request.PathValue("jobID")
+	action := e.Request.PathValue("action")
+	switch action {
+	case "pause":
+		_, _ = m.options.JobService.PauseJob(e.Request.Context(), jobID)
+	case "resume":
+		_, _ = m.options.JobService.ResumeJob(e.Request.Context(), jobID)
+	case "run":
+		_, _ = m.options.JobService.RecordRun(e.Request.Context(), jobs.RecordRunInput{
+			ProfileID:    m.options.Profile.Slug,
+			JobID:        jobID,
+			Status:       jobs.JobStatusQueued,
+			ScheduledFor: time.Now().UTC(),
+		})
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/jobs?job="+url.QueryEscape(jobID))
+}
+
+func (m *Module) skillsPage(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.SkillsService == nil {
+		return e.InternalServerError("skills service unavailable", nil)
+	}
+	skillList, err := m.options.SkillsService.ListSkills(e.Request.Context(), m.options.Profile.Slug, 100)
+	if err != nil {
+		return e.InternalServerError("failed to list skills", err)
+	}
+	return e.HTML(http.StatusOK, skillsTemplate(struct {
+		AppName string
+		Skills  []skills.Skill
+	}{
+		AppName: m.options.AppName,
+		Skills:  skillList,
+	}))
+}
+
+func (m *Module) skillActionSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.SkillsService == nil {
+		return e.InternalServerError("skills service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	slug := e.Request.PathValue("slug")
+	action := e.Request.PathValue("action")
+	switch action {
+	case "pin":
+		_, _ = m.options.SkillsService.UpdateSkillState(e.Request.Context(), m.options.Profile.Slug, slug, skills.UpdateInput{State: "pinned"})
+	case "archive":
+		_, _ = m.options.SkillsService.UpdateSkillState(e.Request.Context(), m.options.Profile.Slug, slug, skills.UpdateInput{State: "archived"})
+	case "activate":
+		_, _ = m.options.SkillsService.UpdateSkillState(e.Request.Context(), m.options.Profile.Slug, slug, skills.UpdateInput{State: "active"})
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/skills")
+}
+
+func (m *Module) logsPage(e *core.RequestEvent, _ *core.Record) error {
+	logDir := filepath.Join(m.options.Profile.Root, "logs")
+	entries, err := os.ReadDir(logDir)
+	if err != nil && !os.IsNotExist(err) {
+		return e.InternalServerError("failed to read logs", err)
+	}
+	files := make([]string, 0)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".log") {
+			continue
+		}
+		files = append(files, entry.Name())
+	}
+	sort.Strings(files)
+	selected := strings.TrimSpace(e.Request.URL.Query().Get("file"))
+	if selected == "" && len(files) > 0 {
+		selected = files[0]
+	}
+	content := ""
+	if selected != "" {
+		path, err := profile.ResolveOwnedPath(m.options.Profile.Root, filepath.Join("logs", selected))
+		if err != nil {
+			return e.InternalServerError("failed to resolve log path", err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
+			return e.InternalServerError("failed to read log file", err)
+		}
+		content = string(data)
+	}
+	return e.HTML(http.StatusOK, logsTemplate(struct {
+		AppName string
+		Files   []string
+		Current string
+		Content string
+	}{
+		AppName: m.options.AppName,
+		Files:   files,
+		Current: selected,
+		Content: content,
+	}))
 }
 
 func (m *Module) versionInfo(e *core.RequestEvent, _ *core.Record) error {
@@ -794,9 +1000,9 @@ var dashboardPageTmpl = template.Must(template.New("dashboard").Parse(`<!doctype
       </article>
     </section>
     <section class="panel">
-      <h2>Status</h2>
-      <p>Open the operator status page at <a href="/dashboard/status">/dashboard/status</a>.</p>
-      <p>Open the browser chat MVP at <a href="/chat">/chat</a>.</p>
+      <h2>Operator Console</h2>
+      <p>Open the operator status page at <a href="/dashboard/status">/dashboard/status</a>, the browser chat at <a href="/chat">/chat</a>, and the sessions explorer at <a href="/dashboard/sessions">/dashboard/sessions</a>.</p>
+      <p>Inspect run detail from <a href="/dashboard/runs/">/dashboard/runs/&lt;runID&gt;</a>, cron jobs at <a href="/dashboard/jobs">/dashboard/jobs</a>, skills at <a href="/dashboard/skills">/dashboard/skills</a>, and logs at <a href="/dashboard/logs">/dashboard/logs</a>.</p>
       <p>Review approval requests at <a href="/dashboard/approvals">/dashboard/approvals</a> and inspect effective tool availability at <a href="/dashboard/tools">/dashboard/tools</a>.</p>
       <p>Machine-readable endpoints: <a href="/health">/health</a>, <a href="/health/detailed">/health/detailed</a>, <a href="/api/version">/api/version</a>.</p>
     </section>
@@ -821,6 +1027,10 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!doctype html>
     <p>Operator: {{.OperatorEmail}}</p>
     <p>Bind address: {{.BindAddress}}</p>
     <p>Loaded provider entries: {{.ProviderCount}}</p>
+    <p>Scheduler enabled: {{.Scheduler.Enabled}}</p>
+    <p>Scheduler poll interval: {{.Scheduler.PollInterval}}</p>
+    <p>Scheduler dispatched jobs: {{.Scheduler.DispatchedJobs}}</p>
+    <p>Scheduler last error: {{if .Scheduler.LastError}}{{.Scheduler.LastError}}{{else}}none{{end}}</p>
   </section>
 </body>
 </html>`))
@@ -1185,6 +1395,13 @@ func (m *Module) pendingApprovalCount(ctx context.Context) int {
 	return len(requests)
 }
 
+func (m *Module) schedulerStatus() jobs.SchedulerStatus {
+	if m.options.Scheduler == nil {
+		return jobs.SchedulerStatus{}
+	}
+	return m.options.Scheduler.Status()
+}
+
 func parseToolPrompt(prompt string) (*tools.Invocation, error) {
 	trimmed := strings.TrimSpace(prompt)
 	if !strings.HasPrefix(trimmed, "/tool ") {
@@ -1303,5 +1520,211 @@ func approvalsTemplate(data approvalsPageData) string {
 func toolsTemplate(data toolsPageData) string {
 	var sb strings.Builder
 	_ = toolsPageTmpl.Execute(&sb, data)
+	return sb.String()
+}
+
+var sessionsPageTmpl = template.Must(template.New("sessions").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Sessions</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
+    form { display: flex; gap: .5rem; }
+    input, button { font: inherit; }
+    input { flex: 1; padding: .6rem .75rem; border: 1px solid #d9e2ec; border-radius: .6rem; }
+    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Sessions</h1>
+    <p><a href="/dashboard">Back to dashboard</a></p>
+    <form method="get" action="/dashboard/sessions">
+      <input type="search" name="q" value="{{.Query}}" placeholder="Search sessions and messages">
+      <button type="submit">Search</button>
+    </form>
+    <h2>Recent Sessions</h2>
+    {{range .List}}
+      <article class="item">
+        <strong>{{.Title}}</strong>
+        <div>Status: {{.Status}} · Source: {{.Source}}</div>
+        <div><a href="/chat?session={{.ID}}">Open chat</a></div>
+      </article>
+    {{else}}
+      <p>No sessions yet.</p>
+    {{end}}
+    <h2>Search Results</h2>
+    {{range .Search}}
+      <article class="item">
+        <strong>{{.Title}}</strong>
+        <div>{{.Snippet}}</div>
+        <div><a href="/chat?session={{.SessionID}}">Open session</a></div>
+      </article>
+    {{else}}
+      <p>No search results.</p>
+    {{end}}
+  </section>
+</body>
+</html>`))
+
+var runDetailPageTmpl = template.Must(template.New("run-detail").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Run Detail</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    .event { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
+    pre { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Run Detail</h1>
+    <p><a href="/dashboard">Back to dashboard</a></p>
+    <p>Run: {{.Run.ID}}</p>
+    <p>Status: {{.Run.Status}}</p>
+    <p>Trigger: {{.Run.TriggerSource}}</p>
+    <p>Error: {{if .Run.ErrorMessage}}{{.Run.ErrorMessage}}{{else}}none{{end}}</p>
+    <h2>Events</h2>
+    {{range .Events}}
+      <article class="event">
+        <strong>{{.Type}}</strong>
+        <div>Sequence {{.Sequence}} · {{.Timestamp}}</div>
+        <pre>{{printf "%v" .Payload}}</pre>
+      </article>
+    {{else}}
+      <p>No events recorded.</p>
+    {{end}}
+  </section>
+</body>
+</html>`))
+
+var jobsPageTmpl = template.Must(template.New("jobs").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Jobs</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
+    form { display: inline-flex; gap: .5rem; margin-top: .5rem; }
+    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Cron Jobs</h1>
+    <p><a href="/dashboard">Back to dashboard</a></p>
+    {{range .Jobs}}
+      <article class="item">
+        <strong>{{.Name}}</strong>
+        <div>{{.ScheduleKind}} · {{.ScheduleValue}} · enabled={{.Enabled}}</div>
+        <div><a href="/dashboard/jobs?job={{.ID}}">History</a></div>
+      </article>
+    {{else}}
+      <p>No jobs configured yet.</p>
+    {{end}}
+    <h2>Selected Job History</h2>
+    {{range .History}}
+      <article class="item">
+        <strong>{{.Status}}</strong>
+        <div>Run {{if .RunID}}{{.RunID}}{{else}}not linked{{end}}</div>
+        <div>{{.OutputExcerpt}}</div>
+      </article>
+    {{else}}
+      <p>Select a job to inspect run history.</p>
+    {{end}}
+  </section>
+</body>
+</html>`))
+
+var skillsPageTmpl = template.Must(template.New("skills").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Skills</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Skills</h1>
+    <p><a href="/dashboard">Back to dashboard</a></p>
+    {{range .Skills}}
+      <article class="item">
+        <strong>{{.Name}}</strong>
+        <div>Slug: {{.Slug}} · State: {{.State}} · Trust: {{.TrustLevel}}</div>
+        <div>Path: {{.RootPath}}/{{.EntryFile}}</div>
+      </article>
+    {{else}}
+      <p>No skills registered yet.</p>
+    {{end}}
+  </section>
+</body>
+</html>`))
+
+var logsPageTmpl = template.Must(template.New("logs").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Logs</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    pre { white-space: pre-wrap; background: #102a43; color: #f0f4f8; padding: 1rem; border-radius: .85rem; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Logs</h1>
+    <p><a href="/dashboard">Back to dashboard</a></p>
+    <p>Files: {{range .Files}}<a href="/dashboard/logs?file={{.}}">{{.}}</a> {{else}}none{{end}}</p>
+    <h2>{{if .Current}}{{.Current}}{{else}}No log selected{{end}}</h2>
+    <pre>{{if .Content}}{{.Content}}{{else}}No log content yet.{{end}}</pre>
+  </section>
+</body>
+</html>`))
+
+func sessionsTemplate(data any) string {
+	var sb strings.Builder
+	_ = sessionsPageTmpl.Execute(&sb, data)
+	return sb.String()
+}
+
+func runDetailTemplate(data any) string {
+	var sb strings.Builder
+	_ = runDetailPageTmpl.Execute(&sb, data)
+	return sb.String()
+}
+
+func jobsTemplate(data any) string {
+	var sb strings.Builder
+	_ = jobsPageTmpl.Execute(&sb, data)
+	return sb.String()
+}
+
+func skillsTemplate(data any) string {
+	var sb strings.Builder
+	_ = skillsPageTmpl.Execute(&sb, data)
+	return sb.String()
+}
+
+func logsTemplate(data any) string {
+	var sb strings.Builder
+	_ = logsPageTmpl.Execute(&sb, data)
 	return sb.String()
 }
