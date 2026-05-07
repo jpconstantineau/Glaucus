@@ -1,0 +1,14 @@
+providerId: selfhosted-openai
+displayName: Self-Hosted OpenAI Compatible
+family: openai-compatible
+baseURL: http://localhost:4000/v1
+dialect: openai-chat
+models:
+  - providerModelId: local-general
+    displayName: Local General Model
+    capabilities:
+      - chat
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 16384
+      maxOutputTokens: 4096

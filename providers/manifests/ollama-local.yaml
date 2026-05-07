@@ -1,0 +1,15 @@
+providerId: ollama-local
+displayName: Local Ollama
+family: ollama
+baseURL: http://127.0.0.1:11434/v1
+dialect: openai-chat
+models:
+  - providerModelId: llama3.2
+    displayName: Llama 3.2
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 8192
+      maxOutputTokens: 2048

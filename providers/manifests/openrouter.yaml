@@ -1,0 +1,20 @@
+providerId: openrouter
+displayName: OpenRouter
+family: openrouter
+baseURL: https://openrouter.ai/api/v1
+dialect: openai-chat
+headers:
+  HTTP-Referer: https://github.com/jpconstantineau/Glaucus
+models:
+  - providerModelId: openai/gpt-4.1-mini
+    displayName: GPT-4.1 Mini via OpenRouter
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: ga
+    limits:
+      contextWindow: 128000
+      maxOutputTokens: 16384
+    requiredHeaders:
+      - name: X-Title
+        description: Optional ranking metadata for OpenRouter requests.
