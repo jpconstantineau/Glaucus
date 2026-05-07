@@ -4,8 +4,116 @@ family: ollama
 baseURL: http://127.0.0.1:11434/v1
 dialect: openai-chat
 models:
-  - providerModelId: llama3.2
-    displayName: Llama 3.2
+  - providerModelId: gemma4:e4b
+    displayName: Gemma 4 E4B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 8192
+      maxOutputTokens: 2048
+  - providerModelId: deepseek-r1:8b
+    displayName: DeepSeek R1 8B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 32768
+      maxOutputTokens: 4096
+  - providerModelId: qwen3.5:9b
+    displayName: Qwen 3.5 9B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 32768
+      maxOutputTokens: 4096
+  - providerModelId: cogito:8b
+    displayName: Cogito 8B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 16384
+      maxOutputTokens: 4096
+  - providerModelId: granite4.1:8b
+    displayName: Granite 4.1 8B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 16384
+      maxOutputTokens: 4096
+  - providerModelId: hermes3:8b
+    displayName: Hermes 3 8B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 16384
+      maxOutputTokens: 4096
+  - providerModelId: gemma4:e2b
+    displayName: Gemma 4 E2B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 8192
+      maxOutputTokens: 2048
+  - providerModelId: llama3.1:8b
+    displayName: Llama 3.1 8B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 8192
+      maxOutputTokens: 2048
+  - providerModelId: mistral-nemo:12b
+    displayName: Mistral Nemo 12B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 32768
+      maxOutputTokens: 4096
+  - providerModelId: ministral-3:14b
+    displayName: Ministral 3 14B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 32768
+      maxOutputTokens: 4096
+  - providerModelId: nemotron-3-nano:4b
+    displayName: Nemotron 3 Nano 4B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 16384
+      maxOutputTokens: 4096
+  - providerModelId: gpt-oss:20b
+    displayName: GPT OSS 20B
+    capabilities:
+      - chat
+      - tools
+    lifecycleStatus: preview
+    limits:
+      contextWindow: 32768
+      maxOutputTokens: 4096
+  - providerModelId: llama3.2:3b
+    displayName: Llama 3.2 3B
     capabilities:
       - chat
       - tools

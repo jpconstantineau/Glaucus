@@ -3,6 +3,7 @@ package profile
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -33,6 +34,23 @@ func TestBootstrapCreatesExpectedLayout(t *testing.T) {
 	for _, path := range expectedPaths {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected %s to exist: %v", path, err)
+		}
+	}
+
+	configPath := filepath.Join(active.Root, "config.yaml")
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+
+	configText := string(configBytes)
+	for _, expected := range []string{
+		"defaultProvider: ollama-local",
+		"defaultModel: llama3.2:3b",
+		"baseURL: http://127.0.0.1:11434/v1",
+	} {
+		if !strings.Contains(configText, expected) {
+			t.Fatalf("expected generated config to contain %q, got:\n%s", expected, configText)
 		}
 	}
 }

@@ -1,0 +1,14 @@
+model:
+  defaultProvider: ollama-local
+  defaultModel: llama3.2:3b
+
+providers:
+  ollama-local:
+    baseURL: http://127.0.0.1:11434/v1
+    dialect: openai-chat
+
+web:
+  bindAddress: 127.0.0.1:8090
+
+pocketbase:
+  dataDir: pb_data

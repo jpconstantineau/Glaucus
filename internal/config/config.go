@@ -92,8 +92,8 @@ type PluginsConfig struct {
 func Default() Config {
 	return Config{
 		Model: ModelConfig{
-			DefaultProvider: "openai",
-			DefaultModel:    "gpt-4.1-mini",
+			DefaultProvider: "ollama-local",
+			DefaultModel:    "llama3.2:3b",
 		},
 		Providers: map[string]ProviderConfig{},
 		Agent: AgentConfig{
