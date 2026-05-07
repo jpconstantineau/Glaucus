@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
 	"github.com/jpconstantineau/Glaucus/internal/tools"
@@ -26,6 +27,8 @@ type ExecuteRunInput struct {
 	TriggerSource    string
 	UserMessageID    string
 	Surface          string
+	Actor            string
+	ApprovalMode     string
 	ToolResolution   tools.Resolution
 	ToolInvocation   *tools.Invocation
 	Prompt           PromptDocument
@@ -46,14 +49,16 @@ type Orchestrator struct {
 	router   *providers.Router
 	events   *EventService
 	tools    *tools.Registry
+	approval *approvals.Service
 }
 
-func NewOrchestrator(sessionService *sessions.Service, router *providers.Router, eventService *EventService, registry *tools.Registry) *Orchestrator {
+func NewOrchestrator(sessionService *sessions.Service, router *providers.Router, eventService *EventService, registry *tools.Registry, approvalService *approvals.Service) *Orchestrator {
 	return &Orchestrator{
 		sessions: sessionService,
 		router:   router,
 		events:   eventService,
 		tools:    registry,
+		approval: approvalService,
 	}
 }
 
@@ -203,6 +208,66 @@ func (o *Orchestrator) processToolRun(ctx context.Context, run sessions.Run, inp
 	tool, ok := o.tools.Tool(invocation.Name)
 	if !ok {
 		return o.failToolRun(run, "tool_not_registered", fmt.Sprintf("tool %q is not registered", invocation.Name))
+	}
+	definition := tool.Definition()
+	if o.approval != nil {
+		evaluation, err := o.approval.Evaluate(ctx, approvals.EvaluationInput{
+			ProfileID:      input.ProfileID,
+			SessionID:      input.SessionID,
+			RunID:          run.ID,
+			ToolName:       invocation.Name,
+			ToolDefinition: definition,
+			Arguments:      invocation.Arguments,
+			Mode:           input.ApprovalMode,
+			Actor:          input.Actor,
+		})
+		if err != nil {
+			return o.failToolRun(run, "approval_evaluation_failed", err.Error())
+		}
+		if evaluation.Denied {
+			updatedRun, updateErr := o.sessions.UpdateRun(context.Background(), run.ID, sessions.UpdateRunInput{
+				Status:       RunStatusFailed,
+				EndedAt:      time.Now().UTC(),
+				ErrorCode:    "approval_denied",
+				ErrorMessage: evaluation.Reason,
+			})
+			if updateErr != nil {
+				return ExecuteRunResult{}, updateErr
+			}
+			o.appendEvent(context.Background(), updatedRun, "tool.approval_denied", map[string]any{
+				"name":    invocation.Name,
+				"reason":  evaluation.Reason,
+				"request": evaluation.Request,
+			}, true)
+			return ExecuteRunResult{
+				Run: updatedRun,
+				Response: providers.NormalizedResponse{
+					OutputText: evaluation.Reason,
+				},
+			}, errors.New(evaluation.Reason)
+		}
+		if evaluation.RequiresApproval {
+			updatedRun, updateErr := o.sessions.UpdateRun(context.Background(), run.ID, sessions.UpdateRunInput{
+				Status:       RunStatusFailed,
+				EndedAt:      time.Now().UTC(),
+				ErrorCode:    "approval_required",
+				ErrorMessage: evaluation.Reason,
+			})
+			if updateErr != nil {
+				return ExecuteRunResult{}, updateErr
+			}
+			o.appendEvent(context.Background(), updatedRun, "tool.approval_requested", map[string]any{
+				"name":    invocation.Name,
+				"reason":  evaluation.Reason,
+				"request": evaluation.Request,
+			}, true)
+			return ExecuteRunResult{
+				Run: updatedRun,
+				Response: providers.NormalizedResponse{
+					OutputText: "Approval required before the tool can run.",
+				},
+			}, errors.New("approval required")
+		}
 	}
 
 	o.appendEvent(context.Background(), run, "tool.started", map[string]any{

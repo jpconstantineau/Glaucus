@@ -297,7 +297,7 @@ func (m *Module) chatTranscript(e *core.RequestEvent, _ *core.Record) error {
 	return e.HTML(http.StatusOK, transcriptTemplate(messages))
 }
 
-func (m *Module) chatSend(e *core.RequestEvent, _ *core.Record) error {
+func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 	if m.options.SessionService == nil || m.options.PromptBuilder == nil || m.options.Orchestrator == nil {
 		return e.InternalServerError("chat runtime unavailable", nil)
 	}
@@ -383,6 +383,8 @@ func (m *Module) chatSend(e *core.RequestEvent, _ *core.Record) error {
 		TriggerSource:  "web_chat",
 		UserMessageID:  userMessage.ID,
 		Surface:        tools.SurfaceWebChat,
+		Actor:          operator.Email(),
+		ApprovalMode:   m.options.LoadedConfig.Approvals.Mode,
 		ToolResolution: toolResolution,
 		ToolInvocation: invocation,
 		Prompt:         promptDoc,

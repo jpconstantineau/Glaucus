@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
@@ -103,7 +104,8 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	processService := tools.NewBackgroundProcessService(pb)
 	tools.RegisterProcessTools(runtime.tools, processService)
 	tools.RegisterWebTools(runtime.tools, tools.NewHTTPWebBackend(), nil)
-	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools)
+	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
+	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
 
 	sessionTTL, err := time.ParseDuration(loadedConfig.Config.Web.SessionTTL)
 	if err != nil || sessionTTL <= 0 {

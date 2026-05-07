@@ -63,7 +63,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 			tools.RegisterCatalogDefaults(r)
 			tools.RegisterFileTools(r)
 			return r
-		}()),
+		}(), nil),
 		ToolRegistry: func() *tools.Registry {
 			r := tools.NewRegistry()
 			tools.RegisterCatalogDefaults(r)
