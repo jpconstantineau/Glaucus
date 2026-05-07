@@ -3,6 +3,7 @@ package web
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"net"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
+	"github.com/jpconstantineau/Glaucus/internal/runtime"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
 )
@@ -30,6 +32,7 @@ type Options struct {
 	SessionTTL              time.Duration
 	Profile                 profile.ActiveProfile
 	ProviderCatalog         providers.Catalog
+	EventService            *runtime.EventService
 	DefaultOperatorEmail    string
 	DefaultOperatorPassword string
 }
@@ -64,6 +67,9 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/dashboard/status", m.withOperatorAuth(m.dashboardStatusPage))
 	rg.GET("/health/detailed", m.withOperatorAuth(m.detailedHealth))
 	rg.GET("/api/version", m.withOperatorAuth(m.versionInfo))
+	rg.GET("/api/dashboard/runs/{runID}/stream", m.withOperatorAuth(m.streamRunEvents))
+	rg.GET("/api/dashboard/sessions/{sessionID}/stream", m.withOperatorAuth(m.streamSessionEvents))
+	rg.GET("/api/dashboard/status/stream", m.withOperatorAuth(m.streamStatusEvents))
 
 	_ = app
 }
@@ -243,6 +249,113 @@ func (m *Module) versionInfo(e *core.RequestEvent, _ *core.Record) error {
 		"commit":   m.options.Commit,
 		"built_at": m.options.BuiltAt,
 	})
+}
+
+func (m *Module) streamRunEvents(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.EventService == nil {
+		return e.JSON(http.StatusServiceUnavailable, map[string]any{"error": "event stream unavailable"})
+	}
+
+	runID := e.Request.PathValue("runID")
+	after := parseAfterSequence(e.Request.URL.Query().Get("after"))
+	events, err := m.options.EventService.ListRunEvents(e.Request.Context(), runID, after)
+	if err != nil {
+		return e.InternalServerError("failed to load run events", err)
+	}
+
+	return m.streamEvents(e, events, func() (<-chan runtime.RunEvent, func()) {
+		return m.options.EventService.SubscribeRun(runID)
+	})
+}
+
+func (m *Module) streamSessionEvents(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.EventService == nil {
+		return e.JSON(http.StatusServiceUnavailable, map[string]any{"error": "event stream unavailable"})
+	}
+
+	sessionID := e.Request.PathValue("sessionID")
+	after := parseAfterSequence(e.Request.URL.Query().Get("after"))
+	events, err := m.options.EventService.ListSessionEvents(e.Request.Context(), sessionID, after)
+	if err != nil {
+		return e.InternalServerError("failed to load session events", err)
+	}
+
+	return m.streamEvents(e, events, func() (<-chan runtime.RunEvent, func()) {
+		return m.options.EventService.SubscribeSession(sessionID)
+	})
+}
+
+func (m *Module) streamStatusEvents(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.EventService == nil {
+		return e.JSON(http.StatusServiceUnavailable, map[string]any{"error": "event stream unavailable"})
+	}
+
+	snapshot, err := m.options.EventService.StatusSnapshot(e.Request.Context())
+	if err != nil {
+		return e.InternalServerError("failed to load status snapshot", err)
+	}
+
+	return m.streamEvents(e, []runtime.RunEvent{snapshot}, func() (<-chan runtime.RunEvent, func()) {
+		return m.options.EventService.SubscribeStatus()
+	})
+}
+
+func (m *Module) streamEvents(
+	e *core.RequestEvent,
+	backlog []runtime.RunEvent,
+	subscribe func() (<-chan runtime.RunEvent, func()),
+) error {
+	e.Response.Header().Set("Content-Type", "text/event-stream")
+	e.Response.Header().Set("Cache-Control", "no-cache")
+	e.Response.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := e.Response.(http.Flusher)
+	if !ok {
+		return e.InternalServerError("streaming unsupported", nil)
+	}
+
+	for _, event := range backlog {
+		if err := writeSSEEvent(e.Response, event); err != nil {
+			return err
+		}
+	}
+	flusher.Flush()
+
+	if e.Request.URL.Query().Get("once") == "1" {
+		return nil
+	}
+
+	ch, unsubscribe := subscribe()
+	defer unsubscribe()
+
+	for {
+		select {
+		case <-e.Request.Context().Done():
+			return nil
+		case event := <-ch:
+			if err := writeSSEEvent(e.Response, event); err != nil {
+				return err
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func writeSSEEvent(w http.ResponseWriter, event runtime.RunEvent) error {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", event.ID, event.Type, payload); err != nil {
+		return err
+	}
+	return nil
+}
+
+func parseAfterSequence(value string) int {
+	var after int
+	_, _ = fmt.Sscanf(strings.TrimSpace(value), "%d", &after)
+	return after
 }
 
 func (m *Module) withOperatorAuth(next func(*core.RequestEvent, *core.Record) error) func(*core.RequestEvent) error {

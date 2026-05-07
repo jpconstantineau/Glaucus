@@ -12,6 +12,7 @@ import (
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
+	"github.com/jpconstantineau/Glaucus/internal/runtime"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 	_ "github.com/pocketbase/pocketbase/migrations"
@@ -51,6 +52,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		SessionTTL:              24 * time.Hour,
 		Profile:                 profile.ActiveProfile{Slug: "default"},
 		ProviderCatalog:         providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1"}}},
+		EventService:            runtime.NewEventService(app),
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
 	}}
@@ -126,6 +128,30 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	mux.ServeHTTP(detailedRes, detailedReq)
 	if detailedRes.Code != http.StatusOK {
 		t.Fatalf("expected 200 from /health/detailed, got %d", detailedRes.Code)
+	}
+
+	runEvent, err := module.options.EventService.Append(t.Context(), runtime.AppendEventInput{
+		ProfileID:  "profile_default",
+		RunID:      "run_1",
+		SessionID:  "session_1",
+		Type:       "run.completed",
+		Payload:    map[string]any{"status": "completed"},
+		IsTerminal: true,
+	})
+	if err != nil {
+		t.Fatalf("append run event: %v", err)
+	}
+
+	streamReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/api/dashboard/runs/run_1/stream?once=1", nil)
+	streamReq.Host = "127.0.0.1:8090"
+	streamReq.AddCookie(sessionCookie)
+	streamRes := httptest.NewRecorder()
+	mux.ServeHTTP(streamRes, streamReq)
+	if streamRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 from run stream, got %d", streamRes.Code)
+	}
+	if !strings.Contains(streamRes.Body.String(), "event: run.completed") || !strings.Contains(streamRes.Body.String(), runEvent.ID) {
+		t.Fatalf("expected run event in SSE response, got %s", streamRes.Body.String())
 	}
 }
 
