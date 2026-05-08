@@ -46,6 +46,7 @@ func buildCollections() []*core.Collection {
 		newToolsetsCollection(),
 		newProviderProfilesCollection(),
 		newPlatformAdaptersCollection(),
+		newPlatformAdapterLogsCollection(),
 		newBackgroundProcessesCollection(),
 		newExportsCollection(),
 	}
@@ -260,7 +261,11 @@ func newPlatformAdaptersCollection() *core.Collection {
 		&core.TextField{Name: "platform", Required: true},
 		&core.BoolField{Name: "enabled"},
 		&core.TextField{Name: "status", Required: true},
+		&core.TextField{Name: "auth_mode"},
 		&core.JSONField{Name: "config_json"},
+		&core.JSONField{Name: "allowlist_json"},
+		&core.JSONField{Name: "capabilities_json"},
+		&core.JSONField{Name: "metadata_json"},
 		&core.DateField{Name: "last_connected_at"},
 		&core.TextField{Name: "last_error"},
 	)

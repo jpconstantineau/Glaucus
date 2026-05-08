@@ -13,6 +13,7 @@ import (
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/memory"
+	"github.com/jpconstantineau/Glaucus/internal/messaging"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
@@ -45,6 +46,7 @@ type Runtime struct {
 	sessions   *sessions.Service
 	jobs       *jobs.Service
 	memory     *memory.Service
+	messaging  *messaging.Gateway
 	search     *search.Service
 	skills     *skills.Service
 	exports    *exportsvc.Service
@@ -112,6 +114,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.sessions = sessions.NewService(pb)
 	runtime.jobs = jobs.NewService(pb)
 	runtime.memory = memory.NewService(pb)
+	runtime.messaging = messaging.NewGateway(pb, runtime.sessions)
 	runtime.events = agentruntime.NewEventService(pb)
 	runtime.prompts = agentruntime.NewPromptBuilder()
 	runtime.search = search.NewService(pb, runtime.sessions)
@@ -197,6 +200,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.lifecycle.Add(runtime.server)
 	runtime.lifecycle.Add(runtime.scheduler)
 	runtime.lifecycle.Add(runtime.curator)
+	runtime.lifecycle.Add(runtime.messaging)
 
 	return runtime, nil
 }
