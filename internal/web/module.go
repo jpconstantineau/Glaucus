@@ -20,6 +20,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
@@ -50,6 +51,7 @@ type Options struct {
 	SearchService           *search.Service
 	SkillsService           *skills.Service
 	ExportService           *exportsvc.Service
+	ObservabilityService    *observability.Service
 	Scheduler               *jobs.Scheduler
 	EventService            *runtime.EventService
 	PromptBuilder           *runtime.PromptBuilder
@@ -84,6 +86,7 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 		return e.Redirect(http.StatusTemporaryRedirect, "/dashboard")
 	})
 	rg.GET("/health", m.publicHealth)
+	rg.GET("/metrics", m.metrics)
 	rg.GET("/login", m.loginPage)
 	rg.POST("/login", m.loginSubmit)
 	rg.POST("/logout", m.withOperatorAuth(m.logoutSubmit))
@@ -112,6 +115,7 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/api/dashboard/sessions", m.withOperatorAuth(m.dashboardSessionsAPI))
 	rg.GET("/api/dashboard/jobs", m.withOperatorAuth(m.dashboardJobsAPI))
 	rg.GET("/api/dashboard/secrets", m.withOperatorAuth(m.dashboardSecretsAPI))
+	rg.GET("/api/dashboard/analytics", m.withOperatorAuth(m.dashboardAnalyticsAPI))
 	rg.GET("/api/dashboard/runs/{runID}/stream", m.withOperatorAuth(m.streamRunEvents))
 	rg.GET("/api/dashboard/sessions/{sessionID}/stream", m.withOperatorAuth(m.streamSessionEvents))
 	rg.GET("/api/dashboard/status/stream", m.withOperatorAuth(m.streamStatusEvents))
@@ -151,6 +155,23 @@ func (m *Module) publicHealth(e *core.RequestEvent) error {
 		"status":  "ok",
 		"service": m.options.AppName,
 	})
+}
+
+func (m *Module) metrics(e *core.RequestEvent) error {
+	if err := m.requireLocalHost(e); err != nil {
+		return err
+	}
+	if m.options.ObservabilityService == nil {
+		return e.JSON(http.StatusServiceUnavailable, map[string]any{"error": "metrics unavailable"})
+	}
+	snapshot, err := m.options.ObservabilityService.Snapshot(e.Request.Context(), m.options.Profile.Slug)
+	if err != nil {
+		return e.InternalServerError("failed to build metrics snapshot", err)
+	}
+	applyLocalWebSafetyHeaders(e.Response)
+	e.Response.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	_, err = e.Response.Write([]byte(m.options.ObservabilityService.Prometheus(snapshot)))
+	return err
 }
 
 func (m *Module) loginPage(e *core.RequestEvent) error {
@@ -808,6 +829,17 @@ func (m *Module) dashboardSecretsAPI(e *core.RequestEvent, _ *core.Record) error
 		return items[i]["provider_id"].(string) < items[j]["provider_id"].(string)
 	})
 	return e.JSON(http.StatusOK, map[string]any{"data": items})
+}
+
+func (m *Module) dashboardAnalyticsAPI(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.ObservabilityService == nil {
+		return e.JSON(http.StatusOK, map[string]any{"data": map[string]any{}})
+	}
+	snapshot, err := m.options.ObservabilityService.Snapshot(e.Request.Context(), m.options.Profile.Slug)
+	if err != nil {
+		return e.InternalServerError("failed to build analytics snapshot", err)
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": snapshot})
 }
 
 func (m *Module) streamRunEvents(e *core.RequestEvent, _ *core.Record) error {
