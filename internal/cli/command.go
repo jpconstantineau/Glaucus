@@ -59,6 +59,8 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer, opts 
 		return importCommand(stdout, args[1:], opts)
 	case "prompt":
 		return promptCommand(ctx, stdout, args[1:], opts)
+	case "acp":
+		return acpCommand(ctx, os.Stdin, stdout, opts)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", command)
 		return errors.New("unknown command")

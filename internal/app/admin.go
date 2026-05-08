@@ -88,9 +88,42 @@ func (r *Runtime) ExecutePrompt(ctx context.Context, text string) (string, error
 	}
 	defer r.CloseStorage()
 
+	_, output, err := r.executePromptRun(ctx, text, "cli.prompt", "cli", tools.SurfaceAPIDefault)
+	return output, err
+}
+
+func (r *Runtime) ExecutePromptRun(ctx context.Context, text string) (sessions.Run, string, error) {
+	if err := r.PrepareStorage(); err != nil {
+		return sessions.Run{}, "", err
+	}
+	defer r.CloseStorage()
+
+	return r.executePromptRun(ctx, text, "acp.prompt", "acp", tools.SurfaceAPIDefault)
+}
+
+func (r *Runtime) GetRun(ctx context.Context, runID string) (sessions.Run, error) {
+	if err := r.PrepareStorage(); err != nil {
+		return sessions.Run{}, err
+	}
+	defer r.CloseStorage()
+
+	return r.sessions.GetRun(ctx, runID)
+}
+
+func (r *Runtime) ListRunEvents(ctx context.Context, runID string, after int) ([]agentruntime.RunEvent, error) {
+	if err := r.PrepareStorage(); err != nil {
+		return nil, err
+	}
+	defer r.CloseStorage()
+
+	return r.events.ListRunEvents(ctx, runID, after)
+}
+
+func (r *Runtime) executePromptRun(ctx context.Context, text, source, actor, surface string) (sessions.Run, string, error) {
+
 	session, err := r.sessions.CreateSession(ctx, sessions.CreateSessionInput{
 		ProfileID: r.profile.Slug,
-		Source:    "cli.prompt",
+		Source:    source,
 		Title:     summarizePromptTitle(text),
 		Status:    "active",
 		ModelSnapshot: map[string]any{
@@ -99,7 +132,7 @@ func (r *Runtime) ExecutePrompt(ctx context.Context, text string) (string, error
 		},
 	})
 	if err != nil {
-		return "", err
+		return sessions.Run{}, "", err
 	}
 
 	userMessage, err := r.sessions.CreateMessage(ctx, sessions.CreateMessageInput{
@@ -110,13 +143,13 @@ func (r *Runtime) ExecutePrompt(ctx context.Context, text string) (string, error
 		VisibleText: text,
 	})
 	if err != nil {
-		return "", err
+		return sessions.Run{}, "", err
 	}
 
-	toolResolution := tools.Resolution{Surface: tools.SurfaceAPIDefault, RequestedToolset: tools.SurfaceAPIDefault}
+	toolResolution := tools.Resolution{Surface: surface, RequestedToolset: tools.SurfaceAPIDefault}
 	if r.tools != nil {
 		toolResolution = r.tools.Resolve(ctx, tools.ResolveRequest{
-			Surface:          tools.SurfaceAPIDefault,
+			Surface:          surface,
 			RequestedToolset: tools.SurfaceAPIDefault,
 			ProfileRoot:      r.profile.Root,
 			WorkingDirectory: r.profile.Root,
@@ -132,16 +165,16 @@ func (r *Runtime) ExecutePrompt(ctx context.Context, text string) (string, error
 		ProviderOverlay: "Use the configured default CLI provider and model.",
 	})
 	if err != nil {
-		return "", err
+		return sessions.Run{}, "", err
 	}
 
 	result, err := r.runs.Execute(ctx, agentruntime.ExecuteRunInput{
 		ProfileID:      r.profile.Slug,
 		SessionID:      session.ID,
-		TriggerSource:  "cli.prompt",
+		TriggerSource:  source,
 		UserMessageID:  userMessage.ID,
-		Surface:        tools.SurfaceAPIDefault,
-		Actor:          "cli",
+		Surface:        surface,
+		Actor:          actor,
 		ApprovalMode:   r.config.Config.Approvals.Mode,
 		ToolResolution: toolResolution,
 		Prompt:         promptDoc,
@@ -167,7 +200,7 @@ func (r *Runtime) ExecutePrompt(ctx context.Context, text string) (string, error
 			Usage:       result.Response.Usage,
 		})
 	}
-	return strings.TrimSpace(result.Response.OutputText), err
+	return result.Run, strings.TrimSpace(result.Response.OutputText), err
 }
 
 func summarizePromptTitle(text string) string {
