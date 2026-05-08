@@ -267,7 +267,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	configReq.AddCookie(sessionCookie)
 	configRes := httptest.NewRecorder()
 	mux.ServeHTTP(configRes, configReq)
-	if configRes.Code != http.StatusOK || !strings.Contains(configRes.Body.String(), `"mcp_servers"`) || !strings.Contains(configRes.Body.String(), `"mcp_lookup"`) || !strings.Contains(configRes.Body.String(), `"plugins"`) || !strings.Contains(configRes.Body.String(), `"dashboard-kit"`) {
+	if configRes.Code != http.StatusOK || !strings.Contains(configRes.Body.String(), `"mcp_servers"`) || !strings.Contains(configRes.Body.String(), `"mcp_lookup"`) || !strings.Contains(configRes.Body.String(), `"plugins"`) || !strings.Contains(configRes.Body.String(), `"dashboard-kit"`) || !strings.Contains(configRes.Body.String(), `"feature_contracts"`) {
 		t.Fatalf("expected config api to expose mcp inspection data, got %d %s", configRes.Code, configRes.Body.String())
 	}
 

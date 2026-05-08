@@ -19,6 +19,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
+	"github.com/jpconstantineau/Glaucus/internal/features"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/mcp"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
@@ -55,6 +56,7 @@ type Options struct {
 	ExportService           *exportsvc.Service
 	MCPService              *mcp.Service
 	PluginService           *plugins.Service
+	FeatureService          *features.Service
 	ObservabilityService    *observability.Service
 	Scheduler               *jobs.Scheduler
 	EventService            *runtime.EventService
@@ -736,6 +738,15 @@ func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error 
 			}
 		}
 	}
+	featureContracts := []any{}
+	if m.options.FeatureService != nil {
+		if items, err := m.options.FeatureService.ListContracts(e.Request.Context(), 50); err == nil {
+			featureContracts = make([]any, 0, len(items))
+			for _, item := range items {
+				featureContracts = append(featureContracts, item)
+			}
+		}
+	}
 	return e.JSON(http.StatusOK, map[string]any{
 		"model": map[string]any{
 			"default_provider": m.options.LoadedConfig.Model.DefaultProvider,
@@ -764,8 +775,9 @@ func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error 
 			"slug": m.options.Profile.Slug,
 			"root": m.options.Profile.Root,
 		},
-		"mcp_servers": mcpServers,
-		"plugins":     pluginList,
+		"mcp_servers":       mcpServers,
+		"plugins":           pluginList,
+		"feature_contracts": featureContracts,
 	})
 }
 
