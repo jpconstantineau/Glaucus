@@ -41,6 +41,49 @@ func TestRouterResolveAndFallbackPlan(t *testing.T) {
 	}
 }
 
+func TestRouterResolveUsesCredentialPoolsAndRoutingPolicy(t *testing.T) {
+	t.Setenv("GLAUCUS_KEY_A", "pool-a")
+	t.Setenv("GLAUCUS_KEY_B", "pool-b")
+
+	catalog := Catalog{Entries: []CatalogEntry{
+		{ProviderID: "provider-a", ModelID: "model-a", Dialect: "openai-chat", BaseURL: "https://provider-a.example/v1", Capabilities: []string{"chat"}},
+		{ProviderID: "provider-b", ModelID: "model-b", Dialect: "openai-chat", BaseURL: "https://provider-b.example/v1", Capabilities: []string{"chat"}},
+	}}
+	cfg := config.Default()
+	cfg.Model.DefaultProvider = "provider-b"
+	cfg.Model.DefaultModel = "model-b"
+	cfg.Providers["provider-a"] = config.ProviderConfig{CredentialPool: "primary-pool"}
+	cfg.CredentialPools["primary-pool"] = config.CredentialPoolConfig{
+		Credentials: []config.CredentialSourceConfig{
+			{Env: "GLAUCUS_KEY_A"},
+			{Env: "GLAUCUS_KEY_B"},
+		},
+		Rotation:           "retry",
+		InheritToSubagents: true,
+	}
+	cfg.Routing.PreferredProviders = []string{"provider-a"}
+	cfg.Routing.DeniedProviders = []string{"provider-b"}
+
+	router := NewRouter(catalog, cfg)
+	resolution, err := router.Resolve(ResolutionInput{RequiredCapabilities: []string{"chat"}})
+	if err != nil {
+		t.Fatalf("resolve provider: %v", err)
+	}
+
+	if resolution.ProviderID != "provider-a" || resolution.CredentialPool != "primary-pool" || resolution.CredentialIndex != 0 {
+		t.Fatalf("unexpected pooled resolution: %#v", resolution)
+	}
+	if resolution.CredentialSource != "credential_pool:primary-pool[0]" {
+		t.Fatalf("unexpected credential source: %s", resolution.CredentialSource)
+	}
+	if resolution.Headers["Authorization"] != "Bearer pool-a" {
+		t.Fatalf("expected pooled auth header, got %#v", resolution.Headers)
+	}
+	if len(resolution.FallbackPlan) != 1 || !resolution.FallbackPlan[0].RetryOnly || resolution.FallbackPlan[0].CredentialIndex != 1 {
+		t.Fatalf("expected retry-only credential rotation fallback, got %#v", resolution.FallbackPlan)
+	}
+}
+
 func TestOpenAIChatAdapter(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {

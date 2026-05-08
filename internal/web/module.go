@@ -748,6 +748,9 @@ func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error 
 		"approvals": map[string]any{
 			"mode": m.options.LoadedConfig.Approvals.Mode,
 		},
+		"credential_pools":  m.options.LoadedConfig.CredentialPools,
+		"routing":           m.options.LoadedConfig.Routing,
+		"auxiliary_routing": m.options.LoadedConfig.AuxiliaryRouting,
 		"profile": map[string]any{
 			"slug": m.options.Profile.Slug,
 			"root": m.options.Profile.Root,
@@ -776,6 +779,8 @@ func (m *Module) dashboardProvidersAPI(e *core.RequestEvent, _ *core.Record) err
 			"lifecycle_status":      entry.LifecycleStatus,
 			"credential_configured": credentialConfigured,
 			"credential_env":        authEnv,
+			"credential_pool":       m.options.LoadedConfig.Providers[entry.ProviderID].CredentialPool,
+			"routing_policy":        m.options.LoadedConfig.Routing,
 			"required_headers":      entry.RequiredHeaders,
 		})
 	}
