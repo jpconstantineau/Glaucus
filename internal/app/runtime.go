@@ -115,6 +115,9 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.jobs = jobs.NewService(pb)
 	runtime.memory = memory.NewService(pb)
 	runtime.messaging = messaging.NewGateway(pb, runtime.sessions)
+	runtime.messaging.Register(messaging.NewTelegramAdapter(messaging.TelegramConfig{
+		ProfileID: activeProfile.Slug,
+	}, nil))
 	runtime.events = agentruntime.NewEventService(pb)
 	runtime.prompts = agentruntime.NewPromptBuilder()
 	runtime.search = search.NewService(pb, runtime.sessions)
