@@ -5,14 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
+	"github.com/jpconstantineau/Glaucus/internal/tools"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
 )
@@ -25,6 +28,10 @@ type Options struct {
 	ProviderCatalog providers.Catalog
 	Router          *providers.Router
 	SessionService  *sessions.Service
+	JobService      *jobs.Service
+	EventService    *runtime.EventService
+	PromptBuilder   *runtime.PromptBuilder
+	ToolRegistry    *tools.Registry
 	Orchestrator    *runtime.Orchestrator
 }
 
@@ -46,6 +53,18 @@ func (m *Module) BindRoutes(rg *router.Router[*core.RequestEvent]) {
 	rg.POST("/v1/responses", m.withBearerAuth(m.responsesCreate))
 	rg.GET("/v1/responses/{responseID}", m.withBearerAuth(m.responsesGet))
 	rg.DELETE("/v1/responses/{responseID}", m.withBearerAuth(m.responsesDelete))
+	rg.POST("/v1/runs", m.withBearerAuth(m.runsCreate))
+	rg.GET("/v1/runs/{runID}", m.withBearerAuth(m.runsGet))
+	rg.GET("/v1/runs/{runID}/events", m.withBearerAuth(m.runsEvents))
+	rg.POST("/v1/runs/{runID}/stop", m.withBearerAuth(m.runsStop))
+	rg.GET("/v1/jobs", m.withBearerAuth(m.jobsList))
+	rg.POST("/v1/jobs", m.withBearerAuth(m.jobsCreate))
+	rg.GET("/v1/jobs/{jobID}", m.withBearerAuth(m.jobsGet))
+	rg.PATCH("/v1/jobs/{jobID}", m.withBearerAuth(m.jobsPatch))
+	rg.POST("/v1/jobs/{jobID}/pause", m.withBearerAuth(m.jobsPause))
+	rg.POST("/v1/jobs/{jobID}/resume", m.withBearerAuth(m.jobsResume))
+	rg.POST("/v1/jobs/{jobID}/run", m.withBearerAuth(m.jobsRun))
+	rg.DELETE("/v1/jobs/{jobID}", m.withBearerAuth(m.jobsDelete))
 	rg.GET("/v1/models", m.withBearerAuth(m.modelsList))
 	rg.GET("/v1/capabilities", m.withBearerAuth(m.capabilitiesGet))
 }
@@ -247,6 +266,304 @@ func (m *Module) responsesDelete(e *core.RequestEvent) error {
 	})
 }
 
+type runsRequest struct {
+	Model        string                     `json:"model"`
+	Instructions string                     `json:"instructions"`
+	Messages     []providers.RequestMessage `json:"messages"`
+}
+
+func (m *Module) runsCreate(e *core.RequestEvent) error {
+	var req runsRequest
+	if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
+		return m.writeError(e, http.StatusBadRequest, "invalid request body")
+	}
+	if len(req.Messages) == 0 {
+		return m.writeError(e, http.StatusBadRequest, "messages are required")
+	}
+
+	session, userMessage, normalized, err := m.createSessionFromMessages(e.Request.Context(), "api.runs", req.Model, req.Messages, req.Instructions)
+	if err != nil {
+		return m.writeError(e, http.StatusBadRequest, err.Error())
+	}
+
+	result, err := m.options.Orchestrator.Execute(e.Request.Context(), runtime.ExecuteRunInput{
+		ProfileID:        m.options.Profile.Slug,
+		SessionID:        session.ID,
+		TriggerSource:    "api.runs",
+		UserMessageID:    userMessage.ID,
+		Surface:          "api",
+		Actor:            "bearer",
+		ApprovalMode:     "manual",
+		Request:          normalized,
+		Resolution:       providers.ResolutionInput{ModelID: req.Model, RequiredCapabilities: []string{"chat"}},
+		WorkingDirectory: m.options.Profile.Root,
+	})
+	if err != nil {
+		return m.writeError(e, http.StatusBadGateway, err.Error())
+	}
+
+	var assistant *sessions.Message
+	if result.Response.OutputText != "" {
+		message, createErr := m.options.SessionService.CreateMessage(e.Request.Context(), sessions.CreateMessageInput{
+			ProfileID:   m.options.Profile.Slug,
+			SessionID:   session.ID,
+			RunID:       result.Run.ID,
+			Role:        "assistant",
+			Content:     sessions.MessageContent{{Type: "output_text", Text: result.Response.OutputText}},
+			VisibleText: result.Response.OutputText,
+			Usage:       result.Response.Usage,
+		})
+		if createErr != nil {
+			return m.writeError(e, http.StatusInternalServerError, createErr.Error())
+		}
+		assistant = &message
+	}
+
+	return e.JSON(http.StatusOK, renderRunResource(result.Run, assistant))
+}
+
+func (m *Module) runsGet(e *core.RequestEvent) error {
+	runID := e.Request.PathValue("runID")
+	run, err := m.options.SessionService.GetRun(e.Request.Context(), runID)
+	if err != nil {
+		return m.writeError(e, http.StatusNotFound, "run not found")
+	}
+	var assistant *sessions.Message
+	messages, _ := m.options.SessionService.ListMessagesByRun(e.Request.Context(), runID)
+	for _, message := range messages {
+		if message.Role == "assistant" {
+			assistant = &message
+			break
+		}
+	}
+	return e.JSON(http.StatusOK, renderRunResource(run, assistant))
+}
+
+func (m *Module) runsEvents(e *core.RequestEvent) error {
+	if m.options.EventService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "event service unavailable")
+	}
+	runID := e.Request.PathValue("runID")
+	after, _ := strconv.Atoi(strings.TrimSpace(e.Request.URL.Query().Get("after")))
+	events, err := m.options.EventService.ListRunEvents(e.Request.Context(), runID, after)
+	if err != nil {
+		return m.writeError(e, http.StatusNotFound, "run not found")
+	}
+	if strings.Contains(e.Request.Header.Get("Accept"), "application/json") {
+		return e.JSON(http.StatusOK, map[string]any{"data": events})
+	}
+
+	e.Response.Header().Set("Content-Type", "text/event-stream")
+	e.Response.Header().Set("Cache-Control", "no-cache")
+	e.Response.Header().Set("Connection", "keep-alive")
+	for _, event := range events {
+		payload, _ := json.Marshal(event)
+		if _, err := fmt.Fprintf(e.Response, "event: %s\ndata: %s\n\n", event.Type, payload); err != nil {
+			return err
+		}
+	}
+	if len(events) == 0 || e.Request.URL.Query().Get("once") == "1" || events[len(events)-1].IsTerminal {
+		return nil
+	}
+
+	ch, unsubscribe := m.options.EventService.SubscribeRun(runID)
+	defer unsubscribe()
+	select {
+	case <-e.Request.Context().Done():
+		return nil
+	case event := <-ch:
+		payload, _ := json.Marshal(event)
+		_, err := fmt.Fprintf(e.Response, "event: %s\ndata: %s\n\n", event.Type, payload)
+		return err
+	}
+}
+
+func (m *Module) runsStop(e *core.RequestEvent) error {
+	runID := e.Request.PathValue("runID")
+	run, err := m.options.Orchestrator.CancelRun(e.Request.Context(), runID)
+	if err != nil {
+		return m.writeError(e, http.StatusNotFound, "run not found")
+	}
+	return e.JSON(http.StatusOK, renderRunResource(run, nil))
+}
+
+type jobsRequest struct {
+	Name              string         `json:"name"`
+	Prompt            string         `json:"prompt"`
+	ScheduleKind      string         `json:"schedule_kind"`
+	ScheduleValue     string         `json:"schedule_value"`
+	Timezone          string         `json:"timezone"`
+	Enabled           *bool          `json:"enabled"`
+	CWD               string         `json:"cwd"`
+	DeliveryTarget    map[string]any `json:"delivery_target"`
+	ToolsetOverrides  map[string]any `json:"toolset_overrides"`
+	ProviderOverrides map[string]any `json:"provider_overrides"`
+}
+
+func (m *Module) jobsList(e *core.RequestEvent) error {
+	if m.options.JobService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "job service unavailable")
+	}
+	items, err := m.options.JobService.ListJobs(e.Request.Context(), m.options.Profile.Slug, 100)
+	if err != nil {
+		return m.writeError(e, http.StatusInternalServerError, err.Error())
+	}
+	data := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		data = append(data, renderJob(item, nil))
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": data})
+}
+
+func (m *Module) jobsCreate(e *core.RequestEvent) error {
+	if m.options.JobService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "job service unavailable")
+	}
+	var req jobsRequest
+	if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
+		return m.writeError(e, http.StatusBadRequest, "invalid request body")
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	job, err := m.options.JobService.CreateJob(e.Request.Context(), jobs.CreateJobInput{
+		ProfileID:         m.options.Profile.Slug,
+		Name:              req.Name,
+		Prompt:            req.Prompt,
+		ScheduleKind:      fallbackString(req.ScheduleKind, "interval"),
+		ScheduleValue:     fallbackString(req.ScheduleValue, "1h"),
+		Timezone:          req.Timezone,
+		Enabled:           enabled,
+		CWD:               req.CWD,
+		DeliveryTarget:    req.DeliveryTarget,
+		ToolsetOverrides:  req.ToolsetOverrides,
+		ProviderOverrides: req.ProviderOverrides,
+	})
+	if err != nil {
+		return m.writeError(e, http.StatusBadRequest, err.Error())
+	}
+	return e.JSON(http.StatusOK, renderJob(job, nil))
+}
+
+func (m *Module) jobsGet(e *core.RequestEvent) error {
+	if m.options.JobService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "job service unavailable")
+	}
+	jobID := e.Request.PathValue("jobID")
+	job, err := m.options.JobService.GetJob(e.Request.Context(), jobID)
+	if err != nil {
+		return m.writeError(e, http.StatusNotFound, "job not found")
+	}
+	history, _ := m.options.JobService.ListRuns(e.Request.Context(), jobID, 25)
+	return e.JSON(http.StatusOK, renderJob(job, history))
+}
+
+func (m *Module) jobsPatch(e *core.RequestEvent) error {
+	if m.options.JobService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "job service unavailable")
+	}
+	var req jobsRequest
+	if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
+		return m.writeError(e, http.StatusBadRequest, "invalid request body")
+	}
+	job, err := m.options.JobService.UpdateJob(e.Request.Context(), e.Request.PathValue("jobID"), jobs.UpdateJobInput{
+		Name:              req.Name,
+		Prompt:            req.Prompt,
+		ScheduleKind:      req.ScheduleKind,
+		ScheduleValue:     req.ScheduleValue,
+		Timezone:          req.Timezone,
+		Enabled:           req.Enabled,
+		CWD:               req.CWD,
+		DeliveryTarget:    req.DeliveryTarget,
+		ToolsetOverrides:  req.ToolsetOverrides,
+		ProviderOverrides: req.ProviderOverrides,
+	})
+	if err != nil {
+		return m.writeError(e, http.StatusBadRequest, err.Error())
+	}
+	return e.JSON(http.StatusOK, renderJob(job, nil))
+}
+
+func (m *Module) jobsPause(e *core.RequestEvent) error {
+	return m.jobStateAction(e, m.options.JobService.PauseJob)
+}
+
+func (m *Module) jobsResume(e *core.RequestEvent) error {
+	return m.jobStateAction(e, m.options.JobService.ResumeJob)
+}
+
+func (m *Module) jobsRun(e *core.RequestEvent) error {
+	if m.options.JobService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "job service unavailable")
+	}
+	jobID := e.Request.PathValue("jobID")
+	job, err := m.options.JobService.GetJob(e.Request.Context(), jobID)
+	if err != nil {
+		return m.writeError(e, http.StatusNotFound, "job not found")
+	}
+
+	now := time.Now().UTC()
+	if m.options.PromptBuilder == nil || m.options.Orchestrator == nil {
+		run, recordErr := m.options.JobService.RecordRun(e.Request.Context(), jobs.RecordRunInput{
+			ProfileID:    m.options.Profile.Slug,
+			JobID:        job.ID,
+			Status:       jobs.JobStatusQueued,
+			ScheduledFor: now,
+		})
+		if recordErr != nil {
+			return m.writeError(e, http.StatusInternalServerError, recordErr.Error())
+		}
+		return e.JSON(http.StatusOK, map[string]any{"job_id": job.ID, "status": run.Status, "run_id": run.RunID})
+	}
+
+	executor := jobs.RuntimeExecutor{
+		Profile:       m.options.Profile,
+		Config:        m.options.Config,
+		Sessions:      m.options.SessionService,
+		PromptBuilder: m.options.PromptBuilder,
+		Orchestrator:  m.options.Orchestrator,
+		ToolRegistry:  m.options.ToolRegistry,
+	}
+	result, execErr := executor.ExecuteJob(e.Request.Context(), job)
+	status := result.Status
+	if status == "" {
+		status = jobs.JobStatusFailed
+	}
+	jobRun, recordErr := m.options.JobService.RecordRun(e.Request.Context(), jobs.RecordRunInput{
+		ProfileID:     m.options.Profile.Slug,
+		JobID:         job.ID,
+		RunID:         result.RunID,
+		Status:        status,
+		ScheduledFor:  now,
+		StartedAt:     now,
+		EndedAt:       time.Now().UTC(),
+		OutputExcerpt: result.OutputText,
+		ErrorMessage:  errorString(execErr),
+	})
+	if recordErr != nil {
+		return m.writeError(e, http.StatusInternalServerError, recordErr.Error())
+	}
+	return e.JSON(http.StatusOK, map[string]any{
+		"job_id":     job.ID,
+		"session_id": result.SessionID,
+		"run_id":     result.RunID,
+		"status":     jobRun.Status,
+		"output":     result.OutputText,
+	})
+}
+
+func (m *Module) jobsDelete(e *core.RequestEvent) error {
+	if m.options.JobService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "job service unavailable")
+	}
+	jobID := e.Request.PathValue("jobID")
+	if err := m.options.JobService.DeleteJob(e.Request.Context(), jobID); err != nil {
+		return m.writeError(e, http.StatusNotFound, "job not found")
+	}
+	return e.JSON(http.StatusOK, map[string]any{"id": jobID, "deleted": true})
+}
+
 func (m *Module) modelsList(e *core.RequestEvent) error {
 	data := make([]map[string]any, 0, len(m.options.ProviderCatalog.Entries))
 	for _, entry := range m.options.ProviderCatalog.Entries {
@@ -273,6 +590,10 @@ func (m *Module) capabilitiesGet(e *core.RequestEvent) error {
 			"responses",
 			"responses.get",
 			"responses.delete",
+			"runs",
+			"run.events",
+			"run.stop",
+			"jobs",
 			"models.list",
 		},
 	})
@@ -280,7 +601,6 @@ func (m *Module) capabilitiesGet(e *core.RequestEvent) error {
 
 func (m *Module) createResponseSession(ctx context.Context, req responsesRequest) (sessions.Session, sessions.Message, providers.NormalizedRequest, error) {
 	requestMessages := make([]providers.RequestMessage, 0, len(req.Input))
-	title := "API response"
 	for _, item := range req.Input {
 		text := flattenInputText(item.Content)
 		if strings.TrimSpace(text) == "" {
@@ -290,21 +610,27 @@ func (m *Module) createResponseSession(ctx context.Context, req responsesRequest
 			Role:    fallbackString(item.Role, "user"),
 			Content: text,
 		})
-		if title == "API response" && text != "" {
-			title = summarizeTitle(text)
-		}
 	}
 	if len(requestMessages) == 0 {
 		return sessions.Session{}, sessions.Message{}, providers.NormalizedRequest{}, fmt.Errorf("input must include at least one text item")
 	}
 
+	return m.createSessionFromMessages(ctx, "api.responses", req.Model, requestMessages, req.Instructions)
+}
+
+func (m *Module) createSessionFromMessages(ctx context.Context, source, model string, requestMessages []providers.RequestMessage, instructions string) (sessions.Session, sessions.Message, providers.NormalizedRequest, error) {
+	title := "API response"
+	if len(requestMessages) > 0 {
+		title = summarizeTitle(requestMessages[0].Content)
+	}
+
 	session, err := m.options.SessionService.CreateSession(ctx, sessions.CreateSessionInput{
 		ProfileID: m.options.Profile.Slug,
-		Source:    "api.responses",
+		Source:    source,
 		Title:     title,
 		Status:    "active",
 		ModelSnapshot: map[string]any{
-			"model": req.Model,
+			"model": model,
 		},
 	})
 	if err != nil {
@@ -336,7 +662,7 @@ func (m *Module) createResponseSession(ctx context.Context, req responsesRequest
 	}
 
 	return session, userMessage, providers.NormalizedRequest{
-		System:   req.Instructions,
+		System:   instructions,
 		Messages: requestMessages,
 	}, nil
 }
@@ -377,12 +703,66 @@ func renderStoredResponse(responseID, model string, message sessions.Message) ma
 	}
 }
 
+func renderRunResource(run sessions.Run, assistant *sessions.Message) map[string]any {
+	data := map[string]any{
+		"id":             run.ID,
+		"object":         "run",
+		"session_id":     run.SessionID,
+		"status":         run.Status,
+		"trigger_source": run.TriggerSource,
+		"started_at":     run.StartedAt,
+		"ended_at":       run.EndedAt,
+		"error_code":     run.ErrorCode,
+		"error_message":  run.ErrorMessage,
+		"request":        run.Request,
+		"resolution":     run.ProviderResolution,
+	}
+	if assistant != nil {
+		data["output_text"] = assistant.VisibleText
+		data["usage"] = assistant.Usage
+	}
+	return data
+}
+
+func renderJob(job jobs.Job, history []jobs.JobRun) map[string]any {
+	data := map[string]any{
+		"id":                 job.ID,
+		"name":               job.Name,
+		"prompt":             job.Prompt,
+		"schedule_kind":      job.ScheduleKind,
+		"schedule_value":     job.ScheduleValue,
+		"timezone":           job.Timezone,
+		"enabled":            job.Enabled,
+		"cwd":                job.CWD,
+		"next_run_at":        job.NextRunAt,
+		"last_run_at":        job.LastRunAt,
+		"delivery_target":    job.DeliveryTarget,
+		"toolset_overrides":  job.ToolsetOverrides,
+		"provider_overrides": job.ProviderOverrides,
+	}
+	if history != nil {
+		data["history"] = history
+	}
+	return data
+}
+
 func (m *Module) writeError(e *core.RequestEvent, status int, message string) error {
 	return e.JSON(status, map[string]any{
 		"error": map[string]any{
 			"message": message,
 		},
 	})
+}
+
+func (m *Module) jobStateAction(e *core.RequestEvent, action func(context.Context, string) (jobs.Job, error)) error {
+	if m.options.JobService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "job service unavailable")
+	}
+	job, err := action(e.Request.Context(), e.Request.PathValue("jobID"))
+	if err != nil {
+		return m.writeError(e, http.StatusNotFound, "job not found")
+	}
+	return e.JSON(http.StatusOK, renderJob(job, nil))
 }
 
 func writeTextStream(e *core.RequestEvent, eventName string, chunks []string, build func(chunk string, index int, final bool) map[string]any) error {
@@ -457,4 +837,11 @@ func fallbackString(primary, fallback string) string {
 		return primary
 	}
 	return fallback
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

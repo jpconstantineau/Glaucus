@@ -176,6 +176,10 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		ProviderCatalog: catalog,
 		Router:          runtime.router,
 		SessionService:  runtime.sessions,
+		JobService:      runtime.jobs,
+		EventService:    runtime.events,
+		PromptBuilder:   runtime.prompts,
+		ToolRegistry:    runtime.tools,
 		Orchestrator:    runtime.runs,
 	})
 

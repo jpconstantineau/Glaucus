@@ -392,6 +392,10 @@ func (o *Orchestrator) cancelRun(ctx context.Context, runID string, attempts []p
 	return run, nil
 }
 
+func (o *Orchestrator) CancelRun(ctx context.Context, runID string) (sessions.Run, error) {
+	return o.cancelRun(ctx, runID, nil)
+}
+
 func (o *Orchestrator) appendEvent(ctx context.Context, run sessions.Run, eventType string, payload map[string]any, terminal bool) {
 	if o.events == nil {
 		return
