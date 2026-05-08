@@ -139,6 +139,26 @@ func RegisterCatalogDefaults(registry *Registry) {
 			DisplayGroup: "web",
 		},
 		{
+			Name:        "send_message",
+			Description: "Send a text message through a configured messaging adapter.",
+			JSONSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"platform":   map[string]any{"type": "string"},
+					"adapter_id": map[string]any{"type": "string"},
+					"chat_id":    map[string]any{"type": "string"},
+					"thread_id":  map[string]any{"type": "string"},
+					"user_scope": map[string]any{"type": "string"},
+					"text":       map[string]any{"type": "string"},
+				},
+				"required": []string{"chat_id", "text"},
+			},
+			Toolsets:     []string{"messaging"},
+			Flags:        ToolFlags{ApprovalSensitive: true, PlatformScoped: true},
+			Concurrency:  "network-bound",
+			DisplayGroup: "messaging",
+		},
+		{
 			Name:        "browser_navigate",
 			Description: "Navigate the configured browser backend to a target page.",
 			JSONSchema: map[string]any{

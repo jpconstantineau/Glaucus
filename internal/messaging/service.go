@@ -223,6 +223,11 @@ func (g *Gateway) Register(adapter Adapter) {
 	g.adapters[adapter.Platform()] = adapter
 }
 
+func (g *Gateway) Adapter(platform string) (Adapter, bool) {
+	adapter, ok := g.adapters[strings.TrimSpace(platform)]
+	return adapter, ok
+}
+
 func (g *Gateway) PlatformCatalog() []PlatformDefinition {
 	items := make([]PlatformDefinition, len(phaseCatalog))
 	copy(items, phaseCatalog)
@@ -302,6 +307,31 @@ func (g *Gateway) ResolveSession(ctx context.Context, event InboundEvent) (sessi
 	})
 }
 
+func (g *Gateway) Ingest(ctx context.Context, event InboundEvent) (sessions.Session, error) {
+	session, err := g.ResolveSession(ctx, event)
+	if err != nil {
+		return sessions.Session{}, err
+	}
+	_, _ = g.AppendLog(context.Background(), LogInput{
+		ProfileID:  event.ProfileID,
+		AdapterID:  event.AdapterID,
+		Platform:   event.Platform,
+		Direction:  "inbound",
+		Status:     "received",
+		SessionKey: g.SessionKey(event),
+		ChatID:     event.ChatID,
+		ThreadID:   event.ThreadID,
+		Summary:    summarizeTitle(firstText(event.Content)),
+		Payload: map[string]any{
+			"actor":       event.Actor,
+			"content":     event.Content,
+			"attachments": event.Attachments,
+			"metadata":    event.Metadata,
+		},
+	})
+	return session, nil
+}
+
 func (g *Gateway) UpsertAdapter(ctx context.Context, input UpsertAdapterInput) (AdapterRecord, error) {
 	if strings.TrimSpace(input.ProfileID) == "" {
 		return AdapterRecord{}, errors.New("profile id is required")
@@ -361,6 +391,15 @@ func (g *Gateway) ListAdapters(ctx context.Context, profileID string) ([]Adapter
 	}
 	_ = ctx
 	return items, nil
+}
+
+func (g *Gateway) GetAdapter(ctx context.Context, adapterID string) (AdapterRecord, error) {
+	record, err := g.app.FindRecordById(CollectionAdapters, adapterID)
+	if err != nil {
+		return AdapterRecord{}, fmt.Errorf("find adapter: %w", err)
+	}
+	_ = ctx
+	return adapterFromRecord(record)
 }
 
 func (g *Gateway) UpdateHealth(ctx context.Context, adapterID string, health AdapterHealth) (AdapterRecord, error) {

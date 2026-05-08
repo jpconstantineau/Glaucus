@@ -121,6 +121,12 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.messaging.Register(messaging.NewDiscordAdapter(messaging.DiscordConfig{
 		ProfileID: activeProfile.Slug,
 	}, nil))
+	runtime.messaging.Register(messaging.NewWebhookAdapter(messaging.WebhookConfig{
+		ProfileID: activeProfile.Slug,
+	}, nil))
+	runtime.messaging.Register(messaging.NewEmailAdapter(messaging.EmailConfig{
+		ProfileID: activeProfile.Slug,
+	}, nil, nil))
 	runtime.events = agentruntime.NewEventService(pb)
 	runtime.prompts = agentruntime.NewPromptBuilder()
 	runtime.search = search.NewService(pb, runtime.sessions)
@@ -134,6 +140,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	processService := tools.NewBackgroundProcessService(pb)
 	tools.RegisterProcessTools(runtime.tools, processService)
 	tools.RegisterWebTools(runtime.tools, tools.NewHTTPWebBackend(), nil)
+	tools.RegisterMessagingTools(runtime.tools, runtime.messaging)
 	tools.RegisterJobTools(runtime.tools, jobToolAdapter{service: runtime.jobs})
 	tools.RegisterPlanningTools(runtime.tools, todoToolAdapter{service: runtime.sessions}, memoryToolAdapter{service: runtime.memory, profileRoot: activeProfile.Root}, searchToolAdapter{service: runtime.search})
 	tools.RegisterSkillsTools(runtime.tools, skillsToolAdapter{service: runtime.skills, profileRoot: activeProfile.Root})
