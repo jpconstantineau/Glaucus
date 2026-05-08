@@ -210,6 +210,10 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		"/dashboard/jobs",
 		"/dashboard/skills",
 		"/dashboard/logs",
+		"/api/dashboard/status",
+		"/api/dashboard/config",
+		"/api/dashboard/providers",
+		"/api/dashboard/secrets",
 	} {
 		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090"+path, nil)
 		req.Host = "127.0.0.1:8090"
@@ -219,6 +223,18 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		if res.Code != http.StatusOK {
 			t.Fatalf("expected 200 from %s, got %d", path, res.Code)
 		}
+	}
+
+	secretsReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/api/dashboard/secrets", nil)
+	secretsReq.Host = "127.0.0.1:8090"
+	secretsReq.AddCookie(sessionCookie)
+	secretsRes := httptest.NewRecorder()
+	mux.ServeHTTP(secretsRes, secretsReq)
+	if !strings.Contains(secretsRes.Body.String(), `"data"`) || strings.Contains(secretsRes.Body.String(), `"secret"`) {
+		t.Fatalf("expected secrets endpoint to expose metadata only, got %s", secretsRes.Body.String())
+	}
+	if secretsRes.Result().Header.Get("X-Frame-Options") != "DENY" {
+		t.Fatalf("expected local web safety headers on dashboard APIs, got %v", secretsRes.Result().Header)
 	}
 }
 
