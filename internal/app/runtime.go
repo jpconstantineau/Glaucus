@@ -118,6 +118,9 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.messaging.Register(messaging.NewTelegramAdapter(messaging.TelegramConfig{
 		ProfileID: activeProfile.Slug,
 	}, nil))
+	runtime.messaging.Register(messaging.NewDiscordAdapter(messaging.DiscordConfig{
+		ProfileID: activeProfile.Slug,
+	}, nil))
 	runtime.events = agentruntime.NewEventService(pb)
 	runtime.prompts = agentruntime.NewPromptBuilder()
 	runtime.search = search.NewService(pb, runtime.sessions)
