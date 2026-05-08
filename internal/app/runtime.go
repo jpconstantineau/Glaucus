@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/jpconstantineau/Glaucus/internal/api"
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
@@ -168,6 +169,14 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		LoadedConfig:            loadedConfig.Config,
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
+	})
+	api.Register(pb, api.Options{
+		Profile:         activeProfile,
+		Config:          loadedConfig.Config,
+		ProviderCatalog: catalog,
+		Router:          runtime.router,
+		SessionService:  runtime.sessions,
+		Orchestrator:    runtime.runs,
 	})
 
 	runtime.server = &pocketbaseService{

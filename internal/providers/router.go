@@ -211,7 +211,7 @@ func (r *Router) selectEntry(input ResolutionInput) (CatalogEntry, error) {
 
 	providerID := strings.TrimSpace(input.ProviderID)
 	modelID := strings.TrimSpace(input.ModelID)
-	if providerID == "" {
+	if providerID == "" && modelID == "" {
 		providerID = strings.TrimSpace(r.config.Model.DefaultProvider)
 	}
 	if modelID == "" {
