@@ -3,6 +3,7 @@ package config
 type Config struct {
 	Model            ModelConfig                     `yaml:"model"`
 	Providers        map[string]ProviderConfig       `yaml:"providers"`
+	MediaProviders   map[string]ProviderConfig       `yaml:"mediaProviders"`
 	Agent            AgentConfig                     `yaml:"agent"`
 	Approvals        ApprovalsConfig                 `yaml:"approvals"`
 	Cron             CronConfig                      `yaml:"cron"`
@@ -139,7 +140,8 @@ func Default() Config {
 			DefaultProvider: "ollama-local",
 			DefaultModel:    "llama3.2:3b",
 		},
-		Providers: map[string]ProviderConfig{},
+		Providers:      map[string]ProviderConfig{},
+		MediaProviders: map[string]ProviderConfig{},
 		Agent: AgentConfig{
 			MaxTurns:        32,
 			BusyInputPolicy: "queue",

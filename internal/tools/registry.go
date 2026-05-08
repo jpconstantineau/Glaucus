@@ -86,6 +86,19 @@ type BrowserBackend interface {
 	Healthy(ctx context.Context) error
 }
 
+type BrowserCapabilities struct {
+	Recording bool   `json:"recording"`
+	Stealth   bool   `json:"stealth"`
+	Proxies   bool   `json:"proxies"`
+	KeepAlive bool   `json:"keepalive"`
+	LiveView  bool   `json:"live_view"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+type BrowserCapabilityReporter interface {
+	Capabilities(ctx context.Context) BrowserCapabilities
+}
+
 type Toolset struct {
 	Name        string
 	Description string

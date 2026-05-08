@@ -745,6 +745,15 @@ func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error 
 			"bind_address": m.options.LoadedConfig.Web.BindAddress,
 			"session_ttl":  m.options.LoadedConfig.Web.SessionTTL,
 		},
+		"media_providers": m.options.LoadedConfig.MediaProviders,
+		"browser_contract": map[string]any{
+			"recording": false,
+			"stealth":   false,
+			"proxies":   false,
+			"keepalive": false,
+			"live_view": false,
+			"reason":    "browser contracts are capability-gated until a backend advertises support",
+		},
 		"approvals": map[string]any{
 			"mode": m.options.LoadedConfig.Approvals.Mode,
 		},
@@ -774,6 +783,7 @@ func (m *Module) dashboardProvidersAPI(e *core.RequestEvent, _ *core.Record) err
 			"model_id":              entry.ModelID,
 			"display_name":          entry.DisplayName,
 			"family":                entry.ProviderFamily,
+			"category":              entry.ProviderCategory,
 			"dialect":               entry.Dialect,
 			"capabilities":          entry.Capabilities,
 			"lifecycle_status":      entry.LifecycleStatus,
@@ -781,10 +791,21 @@ func (m *Module) dashboardProvidersAPI(e *core.RequestEvent, _ *core.Record) err
 			"credential_env":        authEnv,
 			"credential_pool":       m.options.LoadedConfig.Providers[entry.ProviderID].CredentialPool,
 			"routing_policy":        m.options.LoadedConfig.Routing,
+			"availability_reason":   m.providerAvailabilityReason(entry),
 			"required_headers":      entry.RequiredHeaders,
 		})
 	}
 	return e.JSON(http.StatusOK, map[string]any{"data": items})
+}
+
+func (m *Module) providerAvailabilityReason(entry providers.CatalogEntry) string {
+	if entry.ProviderCategory == "text_generation" {
+		return ""
+	}
+	if _, ok := m.options.LoadedConfig.MediaProviders[entry.ProviderID]; ok {
+		return ""
+	}
+	return "media provider category is declared but no media-specific configuration is loaded"
 }
 
 func (m *Module) dashboardToolsetsAPI(e *core.RequestEvent, _ *core.Record) error {

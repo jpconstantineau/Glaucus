@@ -9,7 +9,7 @@ import (
 func TestLoadCatalogReadsRepoManagedManifests(t *testing.T) {
 	dir := t.TempDir()
 
-	manifest := []byte("providerId: ollama-local\ndisplayName: Local Ollama\nfamily: ollama\nbaseURL: http://127.0.0.1:11434/v1\ndialect: openai-chat\nmodels:\n  - providerModelId: llama3.2\n    displayName: Llama 3.2\n    capabilities: [chat, tools]\n    lifecycleStatus: preview\n    limits:\n      contextWindow: 8192\n      maxOutputTokens: 2048\n")
+	manifest := []byte("providerId: ollama-local\ndisplayName: Local Ollama\nfamily: ollama\ncategory: text_generation\nbaseURL: http://127.0.0.1:11434/v1\ndialect: openai-chat\nmodels:\n  - providerModelId: llama3.2\n    displayName: Llama 3.2\n    capabilities: [chat, tools]\n    lifecycleStatus: preview\n    limits:\n      contextWindow: 8192\n      maxOutputTokens: 2048\n")
 	if err := os.WriteFile(filepath.Join(dir, "ollama-local.yaml"), manifest, 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
@@ -29,6 +29,9 @@ func TestLoadCatalogReadsRepoManagedManifests(t *testing.T) {
 	}
 	if entry.BaseURL != "http://127.0.0.1:11434/v1" {
 		t.Fatalf("unexpected base url %q", entry.BaseURL)
+	}
+	if entry.ProviderCategory != "text_generation" {
+		t.Fatalf("unexpected provider category %q", entry.ProviderCategory)
 	}
 }
 
