@@ -20,6 +20,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/mcp"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
@@ -51,6 +52,7 @@ type Options struct {
 	SearchService           *search.Service
 	SkillsService           *skills.Service
 	ExportService           *exportsvc.Service
+	MCPService              *mcp.Service
 	ObservabilityService    *observability.Service
 	Scheduler               *jobs.Scheduler
 	EventService            *runtime.EventService
@@ -714,6 +716,15 @@ func (m *Module) dashboardStatusAPI(e *core.RequestEvent, _ *core.Record) error 
 }
 
 func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error {
+	mcpServers := []any{}
+	if m.options.MCPService != nil {
+		if items, err := m.options.MCPService.ListServers(e.Request.Context(), 50); err == nil {
+			mcpServers = make([]any, 0, len(items))
+			for _, item := range items {
+				mcpServers = append(mcpServers, item)
+			}
+		}
+	}
 	return e.JSON(http.StatusOK, map[string]any{
 		"model": map[string]any{
 			"default_provider": m.options.LoadedConfig.Model.DefaultProvider,
@@ -730,6 +741,7 @@ func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error 
 			"slug": m.options.Profile.Slug,
 			"root": m.options.Profile.Root,
 		},
+		"mcp_servers": mcpServers,
 	})
 }
 

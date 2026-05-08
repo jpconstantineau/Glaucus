@@ -13,6 +13,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	"github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/mcp"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
@@ -47,6 +48,24 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		t.Fatalf("ensure operator: %v", err)
 	}
 	approvalService := approvals.NewService(app, config.Default().Approvals)
+	cfg := config.Default()
+	cfg.MCPServers["reference"] = config.MCPServerConfig{
+		Command: "npx",
+		Args:    []string{"@modelcontextprotocol/server-memory"},
+		Tools: []config.MCPToolConfig{
+			{Name: "mcp_lookup", Description: "Lookup memory", Toolsets: []string{"safe"}, AllowedSurfaces: []string{tools.SurfaceWebChat}, ReadOnly: true},
+		},
+	}
+	registry := func() *tools.Registry {
+		r := tools.NewRegistry()
+		tools.RegisterCatalogDefaults(r)
+		tools.RegisterFileTools(r)
+		return r
+	}()
+	mcpService := mcp.NewService(app)
+	if err := mcpService.Reconcile(t.Context(), cfg, registry); err != nil {
+		t.Fatalf("reconcile mcp service: %v", err)
+	}
 
 	router, err := apis.NewRouter(app)
 	if err != nil {
@@ -73,22 +92,13 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 			Commit:  "local",
 			BuiltAt: "now",
 		}),
-		EventService:  runtime.NewEventService(app),
-		PromptBuilder: runtime.NewPromptBuilder(),
-		Orchestrator: runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, config.Default()), runtime.NewEventService(app), func() *tools.Registry {
-			r := tools.NewRegistry()
-			tools.RegisterCatalogDefaults(r)
-			tools.RegisterFileTools(r)
-			return r
-		}(), nil),
-		ApprovalService: approvalService,
-		ToolRegistry: func() *tools.Registry {
-			r := tools.NewRegistry()
-			tools.RegisterCatalogDefaults(r)
-			tools.RegisterFileTools(r)
-			return r
-		}(),
-		LoadedConfig:            config.Default(),
+		EventService:            runtime.NewEventService(app),
+		PromptBuilder:           runtime.NewPromptBuilder(),
+		Orchestrator:            runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, cfg), runtime.NewEventService(app), registry, nil),
+		ApprovalService:         approvalService,
+		ToolRegistry:            registry,
+		MCPService:              mcpService,
+		LoadedConfig:            cfg,
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
 	}}
@@ -231,6 +241,24 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		if res.Code != http.StatusOK {
 			t.Fatalf("expected 200 from %s, got %d", path, res.Code)
 		}
+	}
+
+	configReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/api/dashboard/config", nil)
+	configReq.Host = "127.0.0.1:8090"
+	configReq.AddCookie(sessionCookie)
+	configRes := httptest.NewRecorder()
+	mux.ServeHTTP(configRes, configReq)
+	if configRes.Code != http.StatusOK || !strings.Contains(configRes.Body.String(), `"mcp_servers"`) || !strings.Contains(configRes.Body.String(), `"mcp_lookup"`) {
+		t.Fatalf("expected config api to expose mcp inspection data, got %d %s", configRes.Code, configRes.Body.String())
+	}
+
+	toolsetsReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/api/dashboard/toolsets", nil)
+	toolsetsReq.Host = "127.0.0.1:8090"
+	toolsetsReq.AddCookie(sessionCookie)
+	toolsetsRes := httptest.NewRecorder()
+	mux.ServeHTTP(toolsetsRes, toolsetsReq)
+	if toolsetsRes.Code != http.StatusOK || !strings.Contains(toolsetsRes.Body.String(), "mcp_lookup") {
+		t.Fatalf("expected toolsets api to expose dynamic mcp tools, got %d %s", toolsetsRes.Code, toolsetsRes.Body.String())
 	}
 
 	secretsReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/api/dashboard/secrets", nil)

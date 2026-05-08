@@ -160,6 +160,36 @@ func (r *Registry) AddToolset(toolset Toolset) {
 	r.toolsets[toolset.Name] = toolset
 }
 
+func (r *Registry) AppendToolToToolset(toolsetName string, toolNames ...string) {
+	toolsetName = strings.TrimSpace(toolsetName)
+	if toolsetName == "" {
+		return
+	}
+
+	toolset, ok := r.toolsets[toolsetName]
+	if !ok {
+		toolset = Toolset{Name: toolsetName}
+	}
+
+	existing := map[string]struct{}{}
+	for _, name := range toolset.Tools {
+		existing[name] = struct{}{}
+	}
+	for _, name := range toolNames {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := existing[trimmed]; ok {
+			continue
+		}
+		toolset.Tools = append(toolset.Tools, trimmed)
+		existing[trimmed] = struct{}{}
+	}
+
+	r.toolsets[toolsetName] = toolset
+}
+
 func (r *Registry) ToolsetNames() []string {
 	names := make([]string, 0, len(r.toolsets))
 	for name := range r.toolsets {

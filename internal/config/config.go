@@ -80,8 +80,21 @@ type SkillsConfig struct {
 }
 
 type MCPServerConfig struct {
-	Command string   `yaml:"command"`
-	Args    []string `yaml:"args"`
+	Command string          `yaml:"command"`
+	Args    []string        `yaml:"args"`
+	Tools   []MCPToolConfig `yaml:"tools"`
+}
+
+type MCPToolConfig struct {
+	Name              string         `yaml:"name"`
+	Description       string         `yaml:"description"`
+	InputSchema       map[string]any `yaml:"inputSchema"`
+	Toolsets          []string       `yaml:"toolsets"`
+	AllowedSurfaces   []string       `yaml:"allowedSurfaces"`
+	Interactive       bool           `yaml:"interactive"`
+	ApprovalSensitive bool           `yaml:"approvalSensitive"`
+	ReadOnly          bool           `yaml:"readOnly"`
+	PlatformScoped    bool           `yaml:"platformScoped"`
 }
 
 type PluginsConfig struct {
