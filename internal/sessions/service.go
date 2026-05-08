@@ -30,11 +30,13 @@ type Session struct {
 	ID              string
 	ProfileID       string
 	Source          string
+	SessionKey      string
 	Title           string
 	ParentSessionID string
 	Status          string
 	ModelSnapshot   map[string]any
 	ToolsetSnapshot map[string]any
+	Metadata        map[string]any
 	Todo            []map[string]any
 	LastMessageAt   time.Time
 	CreatedAt       time.Time
@@ -78,11 +80,13 @@ type Run struct {
 type CreateSessionInput struct {
 	ProfileID       string
 	Source          string
+	SessionKey      string
 	Title           string
 	ParentSessionID string
 	Status          string
 	ModelSnapshot   map[string]any
 	ToolsetSnapshot map[string]any
+	Metadata        map[string]any
 	Todo            []map[string]any
 }
 
@@ -151,6 +155,7 @@ func (s *Service) CreateSession(ctx context.Context, input CreateSessionInput) (
 
 	record.Set("profile_id", input.ProfileID)
 	record.Set("source", input.Source)
+	record.Set("session_key", input.SessionKey)
 	record.Set("title", input.Title)
 	record.Set("parent_session_id", input.ParentSessionID)
 	record.Set("status", input.Status)
@@ -158,6 +163,9 @@ func (s *Service) CreateSession(ctx context.Context, input CreateSessionInput) (
 		return Session{}, err
 	}
 	if err := setJSON(record, "toolset_snapshot_json", input.ToolsetSnapshot); err != nil {
+		return Session{}, err
+	}
+	if err := setJSON(record, "metadata_json", input.Metadata); err != nil {
 		return Session{}, err
 	}
 	if err := setJSON(record, "todo_json", input.Todo); err != nil {
@@ -207,6 +215,30 @@ func (s *Service) ListSessions(ctx context.Context, profileID string, limit int)
 
 	_ = ctx
 	return sessions, nil
+}
+
+func (s *Service) FindSessionByKey(ctx context.Context, profileID, sessionKey string) (Session, error) {
+	if strings.TrimSpace(profileID) == "" {
+		return Session{}, errors.New("profile id is required")
+	}
+	if strings.TrimSpace(sessionKey) == "" {
+		return Session{}, errors.New("session key is required")
+	}
+
+	record, err := s.app.FindFirstRecordByFilter(
+		CollectionSessions,
+		"profile_id = {:profile_id} && session_key = {:session_key}",
+		dbx.Params{
+			"profile_id":  profileID,
+			"session_key": sessionKey,
+		},
+	)
+	if err != nil {
+		return Session{}, fmt.Errorf("find session by key: %w", err)
+	}
+
+	_ = ctx
+	return sessionFromRecord(record)
 }
 
 func (s *Service) ReplaceSessionTodo(ctx context.Context, sessionID string, items []map[string]any) (Session, error) {
@@ -601,6 +633,7 @@ func sessionFromRecord(record *core.Record) (Session, error) {
 	session.ID = record.Id
 	session.ProfileID = record.GetString("profile_id")
 	session.Source = record.GetString("source")
+	session.SessionKey = record.GetString("session_key")
 	session.Title = record.GetString("title")
 	session.ParentSessionID = record.GetString("parent_session_id")
 	session.Status = record.GetString("status")
@@ -611,6 +644,9 @@ func sessionFromRecord(record *core.Record) (Session, error) {
 		return Session{}, err
 	}
 	if err := decodeJSONField(record, "toolset_snapshot_json", &session.ToolsetSnapshot); err != nil {
+		return Session{}, err
+	}
+	if err := decodeJSONField(record, "metadata_json", &session.Metadata); err != nil {
 		return Session{}, err
 	}
 	if err := decodeJSONField(record, "todo_json", &session.Todo); err != nil {

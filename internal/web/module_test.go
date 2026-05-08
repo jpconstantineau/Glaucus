@@ -16,6 +16,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/mcp"
+	"github.com/jpconstantineau/Glaucus/internal/messaging"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/plugins"
@@ -102,8 +103,18 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		SessionService:  sessions.NewService(app),
 		JobService:      jobs.NewService(app),
 		SearchService:   search.NewService(app, sessions.NewService(app)),
-		SkillsService:   skills.NewService(app),
-		ExportService:   exports.NewService(app),
+		MessagingGateway: func() *messaging.Gateway {
+			gateway := messaging.NewGateway(app, sessions.NewService(app))
+			gateway.Register(messaging.NewWebhookAdapter(messaging.WebhookConfig{
+				ProfileID:    "default",
+				AdapterID:    "adapter_webhook",
+				HMACSecret:   "secret",
+				AllowedCIDRs: []string{"127.0.0.0/8"},
+			}, nil))
+			return gateway
+		}(),
+		SkillsService: skills.NewService(app),
+		ExportService: exports.NewService(app),
 		ObservabilityService: observability.NewService(app, observability.BuildInfo{
 			AppName: "Glaucus",
 			Version: "dev",
@@ -191,6 +202,9 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	if !strings.Contains(dashboardRes.Body.String(), "/dashboard/sessions") || !strings.Contains(dashboardRes.Body.String(), "/dashboard/jobs") {
 		t.Fatal("expected dashboard to link to operator console pages")
 	}
+	if !strings.Contains(dashboardRes.Body.String(), "/dashboard/adapters") {
+		t.Fatal("expected dashboard to link to adapters page")
+	}
 
 	detailedReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/health/detailed", nil)
 	detailedReq.Host = "127.0.0.1:8090"
@@ -244,11 +258,13 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	for _, path := range []string{
 		"/dashboard/sessions",
 		"/dashboard/jobs",
+		"/dashboard/adapters",
 		"/dashboard/skills",
 		"/dashboard/logs",
 		"/api/dashboard/status",
 		"/api/dashboard/config",
 		"/api/dashboard/providers",
+		"/api/dashboard/adapters",
 		"/api/dashboard/secrets",
 		"/api/dashboard/analytics",
 	} {

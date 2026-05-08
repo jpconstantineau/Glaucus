@@ -16,6 +16,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/mcp"
 	"github.com/jpconstantineau/Glaucus/internal/memory"
+	"github.com/jpconstantineau/Glaucus/internal/messaging"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/plugins"
@@ -49,6 +50,7 @@ type Runtime struct {
 	sessions   *sessions.Service
 	jobs       *jobs.Service
 	memory     *memory.Service
+	messaging  *messaging.Gateway
 	search     *search.Service
 	skills     *skills.Service
 	exports    *exportsvc.Service
@@ -119,6 +121,19 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.sessions = sessions.NewService(pb)
 	runtime.jobs = jobs.NewService(pb)
 	runtime.memory = memory.NewService(pb)
+	runtime.messaging = messaging.NewGateway(pb, runtime.sessions)
+	runtime.messaging.Register(messaging.NewTelegramAdapter(messaging.TelegramConfig{
+		ProfileID: activeProfile.Slug,
+	}, nil))
+	runtime.messaging.Register(messaging.NewDiscordAdapter(messaging.DiscordConfig{
+		ProfileID: activeProfile.Slug,
+	}, nil))
+	runtime.messaging.Register(messaging.NewWebhookAdapter(messaging.WebhookConfig{
+		ProfileID: activeProfile.Slug,
+	}, nil))
+	runtime.messaging.Register(messaging.NewEmailAdapter(messaging.EmailConfig{
+		ProfileID: activeProfile.Slug,
+	}, nil, nil))
 	runtime.events = agentruntime.NewEventService(pb)
 	runtime.prompts = agentruntime.NewPromptBuilder()
 	runtime.search = search.NewService(pb, runtime.sessions)
@@ -132,6 +147,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	processService := tools.NewBackgroundProcessService(pb)
 	tools.RegisterProcessTools(runtime.tools, processService)
 	tools.RegisterWebTools(runtime.tools, tools.NewHTTPWebBackend(), nil)
+	tools.RegisterMessagingTools(runtime.tools, runtime.messaging)
 	tools.RegisterJobTools(runtime.tools, jobToolAdapter{service: runtime.jobs})
 	tools.RegisterPlanningTools(runtime.tools, todoToolAdapter{service: runtime.sessions}, memoryToolAdapter{service: runtime.memory, profileRoot: activeProfile.Root}, searchToolAdapter{service: runtime.search})
 	tools.RegisterSkillsTools(runtime.tools, skillsToolAdapter{service: runtime.skills, profileRoot: activeProfile.Root})
@@ -172,6 +188,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		SessionService:          runtime.sessions,
 		JobService:              runtime.jobs,
 		SearchService:           runtime.search,
+		MessagingGateway:        runtime.messaging,
 		SkillsService:           runtime.skills,
 		ExportService:           runtime.exports,
 		MCPService:              runtime.mcp,
@@ -223,6 +240,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.lifecycle.Add(runtime.server)
 	runtime.lifecycle.Add(runtime.scheduler)
 	runtime.lifecycle.Add(runtime.curator)
+	runtime.lifecycle.Add(runtime.messaging)
 
 	return runtime, nil
 }
