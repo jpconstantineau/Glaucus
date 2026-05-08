@@ -177,6 +177,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		SessionService:          runtime.sessions,
 		JobService:              runtime.jobs,
 		SearchService:           runtime.search,
+		MessagingGateway:        runtime.messaging,
 		SkillsService:           runtime.skills,
 		ExportService:           runtime.exports,
 		ObservabilityService:    runtime.metrics,

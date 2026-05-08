@@ -234,6 +234,28 @@ func (g *Gateway) PlatformCatalog() []PlatformDefinition {
 	return items
 }
 
+func (g *Gateway) EnsurePhaseOneAdapters(ctx context.Context, profileID string) error {
+	for _, definition := range phaseCatalog {
+		if definition.Phase != 1 {
+			continue
+		}
+		if _, err := g.UpsertAdapter(ctx, UpsertAdapterInput{
+			ProfileID: profileID,
+			Platform:  definition.Name,
+			Enabled:   false,
+			Status:    "not_configured",
+			AuthMode:  firstNonEmpty(definition.AuthPlaceholders...),
+			Metadata: map[string]any{
+				"phase":             definition.Phase,
+				"auth_placeholders": definition.AuthPlaceholders,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (g *Gateway) SessionKey(event InboundEvent) string {
 	thread := strings.TrimSpace(event.ThreadID)
 	if thread == "" {
