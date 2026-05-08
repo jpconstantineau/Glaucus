@@ -50,6 +50,7 @@ func TestRunAllMigrationsCreatesCoreCollectionsAndIsIdempotent(t *testing.T) {
 		"toolsets",
 		"provider_profiles",
 		"platform_adapters",
+		"platform_adapter_logs",
 		"background_processes",
 		"exports",
 	}
@@ -70,5 +71,8 @@ func TestRunAllMigrationsCreatesCoreCollectionsAndIsIdempotent(t *testing.T) {
 	}
 	if sessions.Fields.GetByName("profile_id") == nil {
 		t.Fatal("expected agent_sessions.profile_id field")
+	}
+	if sessions.Fields.GetByName("session_key") == nil {
+		t.Fatal("expected agent_sessions.session_key field")
 	}
 }

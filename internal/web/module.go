@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/messaging"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
@@ -49,6 +51,7 @@ type Options struct {
 	SessionService          *sessions.Service
 	JobService              *jobs.Service
 	SearchService           *search.Service
+	MessagingGateway        *messaging.Gateway
 	SkillsService           *skills.Service
 	ExportService           *exportsvc.Service
 	ObservabilityService    *observability.Service
@@ -96,6 +99,9 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/dashboard/runs/{runID}", m.withOperatorAuth(m.runDetailPage))
 	rg.GET("/dashboard/jobs", m.withOperatorAuth(m.jobsPage))
 	rg.POST("/dashboard/jobs/{jobID}/{action}", m.withOperatorAuth(m.jobActionSubmit))
+	rg.GET("/dashboard/adapters", m.withOperatorAuth(m.adaptersPage))
+	rg.POST("/dashboard/adapters/{adapterID}/save", m.withOperatorAuth(m.adapterSaveSubmit))
+	rg.POST("/dashboard/adapters/{adapterID}/reconnect", m.withOperatorAuth(m.adapterReconnectSubmit))
 	rg.GET("/dashboard/skills", m.withOperatorAuth(m.skillsPage))
 	rg.POST("/dashboard/skills/{slug}/{action}", m.withOperatorAuth(m.skillActionSubmit))
 	rg.GET("/dashboard/logs", m.withOperatorAuth(m.logsPage))
@@ -114,11 +120,13 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/api/dashboard/approvals", m.withOperatorAuth(m.dashboardApprovalsAPI))
 	rg.GET("/api/dashboard/sessions", m.withOperatorAuth(m.dashboardSessionsAPI))
 	rg.GET("/api/dashboard/jobs", m.withOperatorAuth(m.dashboardJobsAPI))
+	rg.GET("/api/dashboard/adapters", m.withOperatorAuth(m.dashboardAdaptersAPI))
 	rg.GET("/api/dashboard/secrets", m.withOperatorAuth(m.dashboardSecretsAPI))
 	rg.GET("/api/dashboard/analytics", m.withOperatorAuth(m.dashboardAnalyticsAPI))
 	rg.GET("/api/dashboard/runs/{runID}/stream", m.withOperatorAuth(m.streamRunEvents))
 	rg.GET("/api/dashboard/sessions/{sessionID}/stream", m.withOperatorAuth(m.streamSessionEvents))
 	rg.GET("/api/dashboard/status/stream", m.withOperatorAuth(m.streamStatusEvents))
+	rg.POST("/gateway/webhooks/{adapterID}", m.webhookIngress)
 
 	_ = app
 }
@@ -597,6 +605,88 @@ func (m *Module) jobActionSubmit(e *core.RequestEvent, _ *core.Record) error {
 	return e.Redirect(http.StatusSeeOther, "/dashboard/jobs?job="+url.QueryEscape(jobID))
 }
 
+func (m *Module) adaptersPage(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.MessagingGateway == nil {
+		return e.InternalServerError("messaging gateway unavailable", nil)
+	}
+	if err := m.options.MessagingGateway.EnsurePhaseOneAdapters(e.Request.Context(), m.options.Profile.Slug); err != nil {
+		return e.InternalServerError("failed to initialize adapters", err)
+	}
+	csrfToken, err := ensureCSRFCookie(e)
+	if err != nil {
+		return e.InternalServerError("failed to create adapters form", err)
+	}
+	items, err := m.options.MessagingGateway.ListAdapters(e.Request.Context(), m.options.Profile.Slug)
+	if err != nil {
+		return e.InternalServerError("failed to list adapters", err)
+	}
+	logs, err := m.options.MessagingGateway.ListLogs(e.Request.Context(), m.options.Profile.Slug, "", 25)
+	if err != nil {
+		return e.InternalServerError("failed to list adapter logs", err)
+	}
+	return e.HTML(http.StatusOK, adaptersTemplate(adaptersPageData{
+		AppName:         m.options.AppName,
+		CSRF:            csrfToken,
+		Items:           items,
+		Logs:            logs,
+		PlatformCatalog: m.options.MessagingGateway.PlatformCatalog(),
+	}))
+}
+
+func (m *Module) adapterSaveSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.MessagingGateway == nil {
+		return e.InternalServerError("messaging gateway unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	adapterID := e.Request.PathValue("adapterID")
+	record, err := m.options.MessagingGateway.GetAdapter(e.Request.Context(), adapterID)
+	if err != nil {
+		return e.InternalServerError("failed to load adapter", err)
+	}
+	if _, err := m.options.MessagingGateway.UpsertAdapter(e.Request.Context(), messaging.UpsertAdapterInput{
+		ProfileID:    record.ProfileID,
+		Platform:     record.Platform,
+		Enabled:      e.Request.FormValue("enabled") == "on",
+		Status:       firstValue(e.Request.FormValue("status"), record.Status),
+		AuthMode:     firstValue(e.Request.FormValue("auth_mode"), record.AuthMode),
+		Config:       record.Config,
+		Allowlist:    splitAllowlist(e.Request.FormValue("allowlist")),
+		Capabilities: record.Capabilities,
+		Metadata:     record.Metadata,
+	}); err != nil {
+		return e.InternalServerError("failed to save adapter", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/adapters")
+}
+
+func (m *Module) adapterReconnectSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.MessagingGateway == nil {
+		return e.InternalServerError("messaging gateway unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	adapterID := e.Request.PathValue("adapterID")
+	record, err := m.options.MessagingGateway.GetAdapter(e.Request.Context(), adapterID)
+	if err != nil {
+		return e.InternalServerError("failed to load adapter", err)
+	}
+	adapter, ok := m.options.MessagingGateway.Adapter(record.Platform)
+	if !ok {
+		return e.InternalServerError("adapter backend is not registered", nil)
+	}
+	health, err := adapter.Health(e.Request.Context())
+	if err != nil {
+		return e.InternalServerError("failed to probe adapter", err)
+	}
+	if _, err := m.options.MessagingGateway.UpdateHealth(e.Request.Context(), adapterID, health); err != nil {
+		return e.InternalServerError("failed to update adapter health", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/adapters")
+}
+
 func (m *Module) skillsPage(e *core.RequestEvent, _ *core.Record) error {
 	if m.options.SkillsService == nil {
 		return e.InternalServerError("skills service unavailable", nil)
@@ -815,6 +905,29 @@ func (m *Module) dashboardJobsAPI(e *core.RequestEvent, _ *core.Record) error {
 	return e.JSON(http.StatusOK, map[string]any{"data": items})
 }
 
+func (m *Module) dashboardAdaptersAPI(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.MessagingGateway == nil {
+		return e.JSON(http.StatusOK, map[string]any{"data": []any{}})
+	}
+	if err := m.options.MessagingGateway.EnsurePhaseOneAdapters(e.Request.Context(), m.options.Profile.Slug); err != nil {
+		return e.InternalServerError("failed to initialize adapters", err)
+	}
+	items, err := m.options.MessagingGateway.ListAdapters(e.Request.Context(), m.options.Profile.Slug)
+	if err != nil {
+		return e.InternalServerError("failed to list adapters", err)
+	}
+	logs, err := m.options.MessagingGateway.ListLogs(e.Request.Context(), m.options.Profile.Slug, "", 10)
+	if err != nil {
+		return e.InternalServerError("failed to list adapter logs", err)
+	}
+	return e.JSON(http.StatusOK, map[string]any{
+		"data":            items,
+		"recent_logs":     logs,
+		"platforms":       m.options.MessagingGateway.PlatformCatalog(),
+		"webhook_ingress": "/gateway/webhooks/{adapterID}",
+	})
+}
+
 func (m *Module) dashboardSecretsAPI(e *core.RequestEvent, _ *core.Record) error {
 	items := make([]map[string]any, 0, len(m.options.LoadedConfig.Providers))
 	for providerID, providerCfg := range m.options.LoadedConfig.Providers {
@@ -888,6 +1001,49 @@ func (m *Module) streamStatusEvents(e *core.RequestEvent, _ *core.Record) error 
 
 	return m.streamEvents(e, []runtime.RunEvent{snapshot}, func() (<-chan runtime.RunEvent, func()) {
 		return m.options.EventService.SubscribeStatus()
+	})
+}
+
+func (m *Module) webhookIngress(e *core.RequestEvent) error {
+	if m.options.MessagingGateway == nil {
+		return e.JSON(http.StatusServiceUnavailable, map[string]any{"error": "messaging gateway unavailable"})
+	}
+	adapterID := e.Request.PathValue("adapterID")
+	record, err := m.options.MessagingGateway.GetAdapter(e.Request.Context(), adapterID)
+	if err != nil {
+		return e.NotFoundError("adapter not found", err)
+	}
+	if record.Platform != messaging.PlatformWebhook {
+		return e.BadRequestError("adapter is not a webhook adapter", nil)
+	}
+	adapter, ok := m.options.MessagingGateway.Adapter(messaging.PlatformWebhook)
+	if !ok {
+		return e.JSON(http.StatusServiceUnavailable, map[string]any{"error": "webhook adapter unavailable"})
+	}
+	normalizer, ok := adapter.(interface {
+		NormalizeRequest(*http.Request, []byte) (messaging.InboundEvent, error)
+	})
+	if !ok {
+		return e.JSON(http.StatusServiceUnavailable, map[string]any{"error": "webhook normalizer unavailable"})
+	}
+	body, err := io.ReadAll(io.LimitReader(e.Request.Body, 1<<20))
+	if err != nil {
+		return e.BadRequestError("failed to read webhook body", err)
+	}
+	event, err := normalizer.NormalizeRequest(e.Request, body)
+	if err != nil {
+		return e.BadRequestError("invalid webhook payload", err)
+	}
+	event.ProfileID = record.ProfileID
+	event.AdapterID = record.ID
+	session, err := m.options.MessagingGateway.Ingest(e.Request.Context(), event)
+	if err != nil {
+		return e.InternalServerError("failed to ingest webhook event", err)
+	}
+	return e.JSON(http.StatusAccepted, map[string]any{
+		"status":      "accepted",
+		"session_id":  session.ID,
+		"session_key": session.SessionKey,
 	})
 }
 
@@ -1196,7 +1352,7 @@ var dashboardPageTmpl = template.Must(template.New("dashboard").Parse(`<!doctype
     <section class="panel">
       <h2>Operator Console</h2>
       <p>Open the operator status page at <a href="/dashboard/status">/dashboard/status</a>, the browser chat at <a href="/chat">/chat</a>, and the sessions explorer at <a href="/dashboard/sessions">/dashboard/sessions</a>.</p>
-      <p>Inspect run detail from <a href="/dashboard/runs/">/dashboard/runs/&lt;runID&gt;</a>, cron jobs at <a href="/dashboard/jobs">/dashboard/jobs</a>, skills at <a href="/dashboard/skills">/dashboard/skills</a>, and logs at <a href="/dashboard/logs">/dashboard/logs</a>.</p>
+      <p>Inspect run detail from <a href="/dashboard/runs/">/dashboard/runs/&lt;runID&gt;</a>, cron jobs at <a href="/dashboard/jobs">/dashboard/jobs</a>, messaging adapters at <a href="/dashboard/adapters">/dashboard/adapters</a>, skills at <a href="/dashboard/skills">/dashboard/skills</a>, and logs at <a href="/dashboard/logs">/dashboard/logs</a>.</p>
       <p>Review approval requests at <a href="/dashboard/approvals">/dashboard/approvals</a> and inspect effective tool availability at <a href="/dashboard/tools">/dashboard/tools</a>.</p>
       <p>Machine-readable endpoints: <a href="/health">/health</a>, <a href="/health/detailed">/health/detailed</a>, <a href="/api/version">/api/version</a>.</p>
     </section>
@@ -1517,6 +1673,14 @@ type toolsPageData struct {
 	AppName  string
 	WebChat  tools.Resolution
 	WebAdmin tools.Resolution
+}
+
+type adaptersPageData struct {
+	AppName         string
+	CSRF            string
+	Items           []messaging.AdapterRecord
+	Logs            []messaging.LogRecord
+	PlatformCatalog []messaging.PlatformDefinition
 }
 
 func (m *Module) approvalsPage(e *core.RequestEvent, _ *core.Record) error {
@@ -1841,6 +2005,80 @@ var jobsPageTmpl = template.Must(template.New("jobs").Parse(`<!doctype html>
 </body>
 </html>`))
 
+var adaptersPageTmpl = template.Must(template.New("adapters").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Messaging Adapters</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 76rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: 1rem; margin-top: .9rem; }
+    .log { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; background: #f8fbfc; }
+    .meta { color: #52606d; font-size: .95rem; }
+    form { display: grid; gap: .65rem; margin-top: .75rem; }
+    textarea, input, button { font: inherit; }
+    textarea, input[type="text"] { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; }
+    .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
+    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
+    code { background: #eef2f6; padding: .1rem .35rem; border-radius: .4rem; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Messaging Adapters</h1>
+    <p><a href="/dashboard">Back to dashboard</a></p>
+    <p>Webhook ingress format posts to <code>/gateway/webhooks/&lt;adapterID&gt;</code> with a JSON body containing <code>actor</code>, <code>chat_id</code>, <code>thread_id</code>, <code>text</code>, optional <code>attachments</code>, and optional <code>metadata</code>.</p>
+    <h2>Configured Adapters</h2>
+    {{range .Items}}
+      <article class="item">
+        <strong>{{.Platform}}</strong>
+        <div class="meta">Status: {{.Status}} · Auth: {{if .AuthMode}}{{.AuthMode}}{{else}}unset{{end}} · Enabled: {{.Enabled}} · Last error: {{if .LastError}}{{.LastError}}{{else}}none{{end}}</div>
+        <div class="meta">Allowlist: {{if .Allowlist}}{{range .Allowlist}}{{.}} {{end}}{{else}}none{{end}}</div>
+        <form method="post" action="/dashboard/adapters/{{.ID}}/save">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <div class="row">
+            <label><input type="checkbox" name="enabled" {{if .Enabled}}checked{{end}}> enabled</label>
+            <input type="text" name="status" value="{{.Status}}" placeholder="status">
+            <input type="text" name="auth_mode" value="{{.AuthMode}}" placeholder="auth mode">
+          </div>
+          <textarea name="allowlist" rows="3" placeholder="one identity or CIDR per line">{{range .Allowlist}}{{.}}
+{{end}}</textarea>
+          <div class="row">
+            <button type="submit">Save</button>
+          </div>
+        </form>
+        <form method="post" action="/dashboard/adapters/{{.ID}}/reconnect">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <button type="submit">Reconnect / Probe Health</button>
+        </form>
+      </article>
+    {{else}}
+      <p>No messaging adapters registered yet.</p>
+    {{end}}
+    <h2>Platform Catalog</h2>
+    {{range .PlatformCatalog}}
+      <article class="item">
+        <strong>{{.Name}}</strong>
+        <div class="meta">Phase {{.Phase}} · Auth placeholders: {{range .AuthPlaceholders}}{{.}} {{end}}</div>
+      </article>
+    {{end}}
+    <h2>Recent Logs</h2>
+    {{range .Logs}}
+      <article class="log">
+        <strong>{{.Platform}}</strong>
+        <div class="meta">{{.Direction}} · {{.Status}} · Session {{if .SessionKey}}{{.SessionKey}}{{else}}n/a{{end}}</div>
+        <div>{{if .Summary}}{{.Summary}}{{else}}no summary{{end}}</div>
+        <div class="meta">{{if .ErrorMessage}}{{.ErrorMessage}}{{else}}no error{{end}}</div>
+      </article>
+    {{else}}
+      <p>No adapter logs yet.</p>
+    {{end}}
+  </section>
+</body>
+</html>`))
+
 var skillsPageTmpl = template.Must(template.New("skills").Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -1911,6 +2149,12 @@ func jobsTemplate(data any) string {
 	return sb.String()
 }
 
+func adaptersTemplate(data adaptersPageData) string {
+	var sb strings.Builder
+	_ = adaptersPageTmpl.Execute(&sb, data)
+	return sb.String()
+}
+
 func skillsTemplate(data any) string {
 	var sb strings.Builder
 	_ = skillsPageTmpl.Execute(&sb, data)
@@ -1921,4 +2165,26 @@ func logsTemplate(data any) string {
 	var sb strings.Builder
 	_ = logsPageTmpl.Execute(&sb, data)
 	return sb.String()
+}
+
+func splitAllowlist(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ','
+	})
+	items := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if trimmed := strings.TrimSpace(field); trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return items
+}
+
+func firstValue(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
