@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
+	"github.com/jpconstantineau/Glaucus/internal/hooks"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
 	"github.com/jpconstantineau/Glaucus/internal/tools"
@@ -50,6 +51,7 @@ type Orchestrator struct {
 	events   *EventService
 	tools    *tools.Registry
 	approval *approvals.Service
+	hooks    *hooks.Bus
 }
 
 func NewOrchestrator(sessionService *sessions.Service, router *providers.Router, eventService *EventService, registry *tools.Registry, approvalService *approvals.Service) *Orchestrator {
@@ -60,6 +62,10 @@ func NewOrchestrator(sessionService *sessions.Service, router *providers.Router,
 		tools:    registry,
 		approval: approvalService,
 	}
+}
+
+func (o *Orchestrator) SetHooks(bus *hooks.Bus) {
+	o.hooks = bus
 }
 
 func (o *Orchestrator) Execute(ctx context.Context, input ExecuteRunInput) (ExecuteRunResult, error) {
@@ -113,6 +119,24 @@ func (o *Orchestrator) ProcessRun(ctx context.Context, run sessions.Run, input E
 
 	if input.ToolInvocation != nil {
 		return o.processToolRun(ctx, run, input)
+	}
+
+	if o.hooks != nil {
+		hookInput, hookID, decision, err := o.hooks.ApplyRun(ctx, hooks.RunContext{
+			ProfileID:  input.ProfileID,
+			SessionID:  input.SessionID,
+			RunID:      run.ID,
+			Request:    input.Request,
+			Resolution: input.Resolution,
+		})
+		if err != nil {
+			return o.failHookedRun(run, "hook_error", err.Error(), hookID, nil)
+		}
+		if decision.Blocked {
+			return o.failHookedRun(run, "hook_blocked", decision.Reason, hookID, decision.Audit)
+		}
+		input.Request = hookInput.Request
+		input.Resolution = hookInput.Resolution
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -199,6 +223,25 @@ func (o *Orchestrator) processToolRun(ctx context.Context, run sessions.Run, inp
 	invocation := input.ToolInvocation
 	if invocation == nil {
 		return o.failToolRun(run, "tool_invocation_missing", "tool invocation missing")
+	}
+
+	if o.hooks != nil {
+		hookInput, hookID, decision, err := o.hooks.ApplyTool(ctx, hooks.ToolContext{
+			ProfileID:  input.ProfileID,
+			SessionID:  input.SessionID,
+			RunID:      run.ID,
+			Surface:    input.Surface,
+			Invocation: *invocation,
+		})
+		if err != nil {
+			return o.failHookedRun(run, "hook_error", err.Error(), hookID, nil)
+		}
+		if decision.Blocked {
+			return o.failHookedRun(run, "hook_blocked", decision.Reason, hookID, decision.Audit)
+		}
+		updatedInvocation := hookInput.Invocation
+		invocation = &updatedInvocation
+		input.ToolInvocation = invocation
 	}
 
 	if !containsTool(input.ToolResolution.ToolNames, invocation.Name) {
@@ -365,6 +408,31 @@ func (o *Orchestrator) failToolRun(run sessions.Run, code, message string) (Exec
 	o.appendEvent(context.Background(), updatedRun, "tool.failed", map[string]any{
 		"status": RunStatusFailed,
 		"error":  message,
+	}, true)
+	return ExecuteRunResult{Run: updatedRun}, errors.New(message)
+}
+
+func (o *Orchestrator) failHookedRun(run sessions.Run, code, message, hookID string, audit map[string]any) (ExecuteRunResult, error) {
+	updatedRun, err := o.sessions.UpdateRun(context.Background(), run.ID, sessions.UpdateRunInput{
+		Status:       RunStatusFailed,
+		EndedAt:      time.Now().UTC(),
+		ErrorCode:    code,
+		ErrorMessage: message,
+		ProviderResolution: map[string]any{
+			"hook": map[string]any{
+				"id":    hookID,
+				"audit": audit,
+			},
+		},
+	})
+	if err != nil {
+		return ExecuteRunResult{}, err
+	}
+	o.appendEvent(context.Background(), updatedRun, "hook.blocked", map[string]any{
+		"status": RunStatusFailed,
+		"hook":   hookID,
+		"reason": message,
+		"audit":  audit,
 	}, true)
 	return ExecuteRunResult{Run: updatedRun}, errors.New(message)
 }

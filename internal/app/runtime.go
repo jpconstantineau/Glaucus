@@ -11,6 +11,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
+	"github.com/jpconstantineau/Glaucus/internal/hooks"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/mcp"
 	"github.com/jpconstantineau/Glaucus/internal/memory"
@@ -142,6 +143,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	}
 	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
+	runtime.runs.SetHooks(hooks.NewBus())
 	pollInterval, err := time.ParseDuration(loadedConfig.Config.Cron.PollInterval)
 	if err != nil || pollInterval <= 0 {
 		pollInterval = time.Minute
