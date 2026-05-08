@@ -20,6 +20,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
@@ -50,6 +51,7 @@ type Options struct {
 	SearchService           *search.Service
 	SkillsService           *skills.Service
 	ExportService           *exportsvc.Service
+	ObservabilityService    *observability.Service
 	Scheduler               *jobs.Scheduler
 	EventService            *runtime.EventService
 	PromptBuilder           *runtime.PromptBuilder
@@ -84,6 +86,7 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 		return e.Redirect(http.StatusTemporaryRedirect, "/dashboard")
 	})
 	rg.GET("/health", m.publicHealth)
+	rg.GET("/metrics", m.metrics)
 	rg.GET("/login", m.loginPage)
 	rg.POST("/login", m.loginSubmit)
 	rg.POST("/logout", m.withOperatorAuth(m.logoutSubmit))
@@ -104,6 +107,15 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.POST("/chat/send", m.withOperatorAuth(m.chatSend))
 	rg.GET("/health/detailed", m.withOperatorAuth(m.detailedHealth))
 	rg.GET("/api/version", m.withOperatorAuth(m.versionInfo))
+	rg.GET("/api/dashboard/status", m.withOperatorAuth(m.dashboardStatusAPI))
+	rg.GET("/api/dashboard/config", m.withOperatorAuth(m.dashboardConfigAPI))
+	rg.GET("/api/dashboard/providers", m.withOperatorAuth(m.dashboardProvidersAPI))
+	rg.GET("/api/dashboard/toolsets", m.withOperatorAuth(m.dashboardToolsetsAPI))
+	rg.GET("/api/dashboard/approvals", m.withOperatorAuth(m.dashboardApprovalsAPI))
+	rg.GET("/api/dashboard/sessions", m.withOperatorAuth(m.dashboardSessionsAPI))
+	rg.GET("/api/dashboard/jobs", m.withOperatorAuth(m.dashboardJobsAPI))
+	rg.GET("/api/dashboard/secrets", m.withOperatorAuth(m.dashboardSecretsAPI))
+	rg.GET("/api/dashboard/analytics", m.withOperatorAuth(m.dashboardAnalyticsAPI))
 	rg.GET("/api/dashboard/runs/{runID}/stream", m.withOperatorAuth(m.streamRunEvents))
 	rg.GET("/api/dashboard/sessions/{sessionID}/stream", m.withOperatorAuth(m.streamSessionEvents))
 	rg.GET("/api/dashboard/status/stream", m.withOperatorAuth(m.streamStatusEvents))
@@ -143,6 +155,23 @@ func (m *Module) publicHealth(e *core.RequestEvent) error {
 		"status":  "ok",
 		"service": m.options.AppName,
 	})
+}
+
+func (m *Module) metrics(e *core.RequestEvent) error {
+	if err := m.requireLocalHost(e); err != nil {
+		return err
+	}
+	if m.options.ObservabilityService == nil {
+		return e.JSON(http.StatusServiceUnavailable, map[string]any{"error": "metrics unavailable"})
+	}
+	snapshot, err := m.options.ObservabilityService.Snapshot(e.Request.Context(), m.options.Profile.Slug)
+	if err != nil {
+		return e.InternalServerError("failed to build metrics snapshot", err)
+	}
+	applyLocalWebSafetyHeaders(e.Response)
+	e.Response.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	_, err = e.Response.Write([]byte(m.options.ObservabilityService.Prometheus(snapshot)))
+	return err
 }
 
 func (m *Module) loginPage(e *core.RequestEvent) error {
@@ -657,6 +686,162 @@ func (m *Module) versionInfo(e *core.RequestEvent, _ *core.Record) error {
 	})
 }
 
+func (m *Module) dashboardStatusAPI(e *core.RequestEvent, _ *core.Record) error {
+	activeRuns := 0
+	if m.options.SessionService != nil {
+		runs, err := m.options.SessionService.ListActiveRuns(e.Request.Context(), m.options.Profile.Slug, 100)
+		if err == nil {
+			activeRuns = len(runs)
+		}
+	}
+	activeJobs := 0
+	if m.options.JobService != nil {
+		jobRuns, err := m.options.JobService.ListActiveJobRuns(e.Request.Context(), m.options.Profile.Slug, 100)
+		if err == nil {
+			activeJobs = len(jobRuns)
+		}
+	}
+	return e.JSON(http.StatusOK, map[string]any{
+		"app_name":          m.options.AppName,
+		"profile_slug":      m.options.Profile.Slug,
+		"provider_count":    len(m.options.ProviderCatalog.Entries),
+		"active_runs":       activeRuns,
+		"active_job_runs":   activeJobs,
+		"pending_approvals": m.pendingApprovalCount(e.Request.Context()),
+		"scheduler_enabled": m.options.LoadedConfig.Cron.Enabled,
+		"local_web_only":    true,
+	})
+}
+
+func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error {
+	return e.JSON(http.StatusOK, map[string]any{
+		"model": map[string]any{
+			"default_provider": m.options.LoadedConfig.Model.DefaultProvider,
+			"default_model":    m.options.LoadedConfig.Model.DefaultModel,
+		},
+		"web": map[string]any{
+			"bind_address": m.options.LoadedConfig.Web.BindAddress,
+			"session_ttl":  m.options.LoadedConfig.Web.SessionTTL,
+		},
+		"approvals": map[string]any{
+			"mode": m.options.LoadedConfig.Approvals.Mode,
+		},
+		"profile": map[string]any{
+			"slug": m.options.Profile.Slug,
+			"root": m.options.Profile.Root,
+		},
+	})
+}
+
+func (m *Module) dashboardProvidersAPI(e *core.RequestEvent, _ *core.Record) error {
+	items := make([]map[string]any, 0, len(m.options.ProviderCatalog.Entries))
+	for _, entry := range m.options.ProviderCatalog.Entries {
+		credentialConfigured := false
+		authEnv := ""
+		if providerCfg, ok := m.options.LoadedConfig.Providers[entry.ProviderID]; ok {
+			authEnv = providerCfg.Auth.Env
+			credentialConfigured = strings.TrimSpace(providerCfg.Auth.Env) != ""
+		}
+		items = append(items, map[string]any{
+			"provider_id":           entry.ProviderID,
+			"model_id":              entry.ModelID,
+			"display_name":          entry.DisplayName,
+			"family":                entry.ProviderFamily,
+			"dialect":               entry.Dialect,
+			"capabilities":          entry.Capabilities,
+			"lifecycle_status":      entry.LifecycleStatus,
+			"credential_configured": credentialConfigured,
+			"credential_env":        authEnv,
+			"required_headers":      entry.RequiredHeaders,
+		})
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": items})
+}
+
+func (m *Module) dashboardToolsetsAPI(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.ToolRegistry == nil {
+		return e.JSON(http.StatusOK, map[string]any{"data": []any{}})
+	}
+	surfaces := []string{tools.SurfaceWebChat, tools.SurfaceWebAdmin, tools.SurfaceAPIDefault, tools.SurfaceBackgroundJob}
+	data := make([]map[string]any, 0, len(surfaces))
+	for _, surface := range surfaces {
+		resolution := m.options.ToolRegistry.Resolve(e.Request.Context(), tools.ResolveRequest{
+			Surface:          surface,
+			RequestedToolset: surface,
+			ProfileRoot:      m.options.Profile.Root,
+			WorkingDirectory: m.options.Profile.Root,
+		})
+		data = append(data, map[string]any{
+			"surface":           surface,
+			"requested_toolset": resolution.RequestedToolset,
+			"toolset_names":     resolution.ToolsetNames,
+			"enabled_tools":     resolution.EnabledTools,
+			"unavailable_tools": resolution.UnavailableTools,
+		})
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": data})
+}
+
+func (m *Module) dashboardApprovalsAPI(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.ApprovalService == nil {
+		return e.JSON(http.StatusOK, map[string]any{"data": []any{}})
+	}
+	items, err := m.options.ApprovalService.ListPending(e.Request.Context(), m.options.Profile.Slug)
+	if err != nil {
+		return e.InternalServerError("failed to list approvals", err)
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": items})
+}
+
+func (m *Module) dashboardSessionsAPI(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.SessionService == nil {
+		return e.JSON(http.StatusOK, map[string]any{"data": []any{}})
+	}
+	items, err := m.options.SessionService.ListSessions(e.Request.Context(), m.options.Profile.Slug, 50)
+	if err != nil {
+		return e.InternalServerError("failed to list sessions", err)
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": items})
+}
+
+func (m *Module) dashboardJobsAPI(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.JobService == nil {
+		return e.JSON(http.StatusOK, map[string]any{"data": []any{}})
+	}
+	items, err := m.options.JobService.ListJobs(e.Request.Context(), m.options.Profile.Slug, 50)
+	if err != nil {
+		return e.InternalServerError("failed to list jobs", err)
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": items})
+}
+
+func (m *Module) dashboardSecretsAPI(e *core.RequestEvent, _ *core.Record) error {
+	items := make([]map[string]any, 0, len(m.options.LoadedConfig.Providers))
+	for providerID, providerCfg := range m.options.LoadedConfig.Providers {
+		items = append(items, map[string]any{
+			"provider_id":           providerID,
+			"auth_env":              providerCfg.Auth.Env,
+			"credential_configured": strings.TrimSpace(providerCfg.Auth.Env) != "",
+			"revealed":              false,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i]["provider_id"].(string) < items[j]["provider_id"].(string)
+	})
+	return e.JSON(http.StatusOK, map[string]any{"data": items})
+}
+
+func (m *Module) dashboardAnalyticsAPI(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.ObservabilityService == nil {
+		return e.JSON(http.StatusOK, map[string]any{"data": map[string]any{}})
+	}
+	snapshot, err := m.options.ObservabilityService.Snapshot(e.Request.Context(), m.options.Profile.Slug)
+	if err != nil {
+		return e.InternalServerError("failed to build analytics snapshot", err)
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": snapshot})
+}
+
 func (m *Module) streamRunEvents(e *core.RequestEvent, _ *core.Record) error {
 	if m.options.EventService == nil {
 		return e.JSON(http.StatusServiceUnavailable, map[string]any{"error": "event stream unavailable"})
@@ -796,6 +981,7 @@ func (m *Module) withOperatorAuth(next func(*core.RequestEvent, *core.Record) er
 		if err := m.requireLocalHost(e); err != nil {
 			return err
 		}
+		applyLocalWebSafetyHeaders(e.Response)
 
 		cookie, err := e.Request.Cookie(sessionCookieName)
 		if err != nil || cookie.Value == "" {
@@ -810,6 +996,14 @@ func (m *Module) withOperatorAuth(next func(*core.RequestEvent, *core.Record) er
 		e.Auth = record
 		return next(e, record)
 	}
+}
+
+func applyLocalWebSafetyHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "same-origin")
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 }
 
 func (m *Module) requireLocalHost(e *core.RequestEvent) error {

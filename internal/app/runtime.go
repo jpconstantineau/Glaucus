@@ -7,12 +7,14 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/jpconstantineau/Glaucus/internal/api"
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/memory"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
+	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	agentruntime "github.com/jpconstantineau/Glaucus/internal/runtime"
@@ -47,6 +49,7 @@ type Runtime struct {
 	skills     *skills.Service
 	exports    *exportsvc.Service
 	curator    *skills.Curator
+	metrics    *observability.Service
 	scheduler  *jobs.Scheduler
 	events     *agentruntime.EventService
 	prompts    *agentruntime.PromptBuilder
@@ -114,6 +117,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.search = search.NewService(pb, runtime.sessions)
 	runtime.skills = skills.NewService(pb)
 	runtime.exports = exportsvc.NewService(pb)
+	runtime.metrics = observability.NewService(pb, observability.BuildInfo{AppName: opts.Name, Version: "dev", Commit: "local", BuiltAt: "unknown"})
 	runtime.router = providers.NewRouter(catalog, loadedConfig.Config)
 	runtime.tools = tools.NewRegistry()
 	tools.RegisterCatalogDefaults(runtime.tools)
@@ -159,6 +163,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		SearchService:           runtime.search,
 		SkillsService:           runtime.skills,
 		ExportService:           runtime.exports,
+		ObservabilityService:    runtime.metrics,
 		Scheduler:               runtime.scheduler,
 		EventService:            runtime.events,
 		PromptBuilder:           runtime.prompts,
@@ -168,6 +173,18 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		LoadedConfig:            loadedConfig.Config,
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
+	})
+	api.Register(pb, api.Options{
+		Profile:         activeProfile,
+		Config:          loadedConfig.Config,
+		ProviderCatalog: catalog,
+		Router:          runtime.router,
+		SessionService:  runtime.sessions,
+		JobService:      runtime.jobs,
+		EventService:    runtime.events,
+		PromptBuilder:   runtime.prompts,
+		ToolRegistry:    runtime.tools,
+		Orchestrator:    runtime.runs,
 	})
 
 	runtime.server = &pocketbaseService{

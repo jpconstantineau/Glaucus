@@ -322,6 +322,36 @@ func (s *Service) ListMessages(ctx context.Context, sessionID string) ([]Message
 	return messages, nil
 }
 
+func (s *Service) ListMessagesByRun(ctx context.Context, runID string) ([]Message, error) {
+	if strings.TrimSpace(runID) == "" {
+		return nil, errors.New("run id is required")
+	}
+
+	records, err := s.app.FindRecordsByFilter(
+		CollectionMessages,
+		"run_id = {:run_id}",
+		"ordinal",
+		0,
+		0,
+		dbx.Params{"run_id": runID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list messages by run: %w", err)
+	}
+
+	messages := make([]Message, 0, len(records))
+	for _, record := range records {
+		message, err := messageFromRecord(record)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, message)
+	}
+
+	_ = ctx
+	return messages, nil
+}
+
 func (s *Service) CreateRun(ctx context.Context, input CreateRunInput) (Run, error) {
 	if strings.TrimSpace(input.ProfileID) == "" {
 		return Run{}, errors.New("profile id is required")
@@ -486,6 +516,58 @@ func (s *Service) ListActiveRuns(ctx context.Context, profileID string, limit in
 
 	_ = ctx
 	return runs, nil
+}
+
+func (s *Service) DeleteRun(ctx context.Context, runID string) error {
+	if strings.TrimSpace(runID) == "" {
+		return errors.New("run id is required")
+	}
+
+	return s.app.RunInTransaction(func(txApp core.App) error {
+		runRecord, err := txApp.FindRecordById(CollectionRuns, runID)
+		if err != nil {
+			return fmt.Errorf("find run: %w", err)
+		}
+
+		messageRecords, err := txApp.FindRecordsByFilter(
+			CollectionMessages,
+			"run_id = {:run_id}",
+			"",
+			0,
+			0,
+			dbx.Params{"run_id": runID},
+		)
+		if err != nil {
+			return fmt.Errorf("list run messages: %w", err)
+		}
+		for _, record := range messageRecords {
+			if err := txApp.Delete(record); err != nil {
+				return fmt.Errorf("delete run message: %w", err)
+			}
+		}
+
+		eventRecords, err := txApp.FindRecordsByFilter(
+			"agent_run_events",
+			"run_id = {:run_id}",
+			"",
+			0,
+			0,
+			dbx.Params{"run_id": runID},
+		)
+		if err != nil {
+			return fmt.Errorf("list run events: %w", err)
+		}
+		for _, record := range eventRecords {
+			if err := txApp.Delete(record); err != nil {
+				return fmt.Errorf("delete run event: %w", err)
+			}
+		}
+
+		if err := txApp.Delete(runRecord); err != nil {
+			return fmt.Errorf("delete run: %w", err)
+		}
+		return nil
+	})
 }
 
 func (s *Service) nextOrdinal(sessionID string) (int, error) {

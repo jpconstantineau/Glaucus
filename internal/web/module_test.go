@@ -14,6 +14,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
+	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
@@ -66,8 +67,14 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		SearchService:   search.NewService(app, sessions.NewService(app)),
 		SkillsService:   skills.NewService(app),
 		ExportService:   exports.NewService(app),
-		EventService:    runtime.NewEventService(app),
-		PromptBuilder:   runtime.NewPromptBuilder(),
+		ObservabilityService: observability.NewService(app, observability.BuildInfo{
+			AppName: "Glaucus",
+			Version: "dev",
+			Commit:  "local",
+			BuiltAt: "now",
+		}),
+		EventService:  runtime.NewEventService(app),
+		PromptBuilder: runtime.NewPromptBuilder(),
 		Orchestrator: runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, config.Default()), runtime.NewEventService(app), func() *tools.Registry {
 			r := tools.NewRegistry()
 			tools.RegisterCatalogDefaults(r)
@@ -210,6 +217,11 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		"/dashboard/jobs",
 		"/dashboard/skills",
 		"/dashboard/logs",
+		"/api/dashboard/status",
+		"/api/dashboard/config",
+		"/api/dashboard/providers",
+		"/api/dashboard/secrets",
+		"/api/dashboard/analytics",
 	} {
 		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090"+path, nil)
 		req.Host = "127.0.0.1:8090"
@@ -219,6 +231,26 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		if res.Code != http.StatusOK {
 			t.Fatalf("expected 200 from %s, got %d", path, res.Code)
 		}
+	}
+
+	secretsReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/api/dashboard/secrets", nil)
+	secretsReq.Host = "127.0.0.1:8090"
+	secretsReq.AddCookie(sessionCookie)
+	secretsRes := httptest.NewRecorder()
+	mux.ServeHTTP(secretsRes, secretsReq)
+	if !strings.Contains(secretsRes.Body.String(), `"data"`) || strings.Contains(secretsRes.Body.String(), `"secret"`) {
+		t.Fatalf("expected secrets endpoint to expose metadata only, got %s", secretsRes.Body.String())
+	}
+	if secretsRes.Result().Header.Get("X-Frame-Options") != "DENY" {
+		t.Fatalf("expected local web safety headers on dashboard APIs, got %v", secretsRes.Result().Header)
+	}
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/metrics", nil)
+	metricsReq.Host = "127.0.0.1:8090"
+	metricsRes := httptest.NewRecorder()
+	mux.ServeHTTP(metricsRes, metricsReq)
+	if metricsRes.Code != http.StatusOK || !strings.Contains(metricsRes.Body.String(), "glaucus_build_info") {
+		t.Fatalf("expected prometheus metrics, got %d %s", metricsRes.Code, metricsRes.Body.String())
 	}
 }
 
