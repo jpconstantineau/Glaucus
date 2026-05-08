@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/mcp"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
+	"github.com/jpconstantineau/Glaucus/internal/plugins"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
@@ -48,6 +51,8 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		t.Fatalf("ensure operator: %v", err)
 	}
 	approvalService := approvals.NewService(app, config.Default().Approvals)
+	profileRoot := t.TempDir()
+	repoPluginsRoot := t.TempDir()
 	cfg := config.Default()
 	cfg.MCPServers["reference"] = config.MCPServerConfig{
 		Command: "npx",
@@ -66,6 +71,19 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	if err := mcpService.Reconcile(t.Context(), cfg, registry); err != nil {
 		t.Fatalf("reconcile mcp service: %v", err)
 	}
+	cfg.Plugins.RepoPaths = []string{filepath.Join(repoPluginsRoot, ".agents", "plugins")}
+	cfg.Plugins.ProfilePaths = []string{"plugins"}
+	pluginManifestPath := filepath.Join(repoPluginsRoot, ".agents", "plugins", "dashboard-kit", ".codex-plugin", "plugin.json")
+	if err := os.MkdirAll(filepath.Dir(pluginManifestPath), 0o755); err != nil {
+		t.Fatalf("mkdir plugin dir: %v", err)
+	}
+	if err := os.WriteFile(pluginManifestPath, []byte(`{"id":"dashboard-kit","name":"Dashboard Kit","category":"dashboard_extension","description":"Dashboard widgets","entryPoint":"index.js","configSchema":{"type":"object"}}`), 0o644); err != nil {
+		t.Fatalf("write plugin manifest: %v", err)
+	}
+	pluginService := plugins.NewService(app)
+	if err := pluginService.Reconcile(t.Context(), profileRoot, cfg.Plugins); err != nil {
+		t.Fatalf("reconcile plugin service: %v", err)
+	}
 
 	router, err := apis.NewRouter(app)
 	if err != nil {
@@ -79,7 +97,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		BuiltAt:         "now",
 		BindAddress:     "127.0.0.1:8090",
 		SessionTTL:      24 * time.Hour,
-		Profile:         profile.ActiveProfile{Slug: "default"},
+		Profile:         profile.ActiveProfile{Slug: "default", Root: profileRoot},
 		ProviderCatalog: providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1"}}},
 		SessionService:  sessions.NewService(app),
 		JobService:      jobs.NewService(app),
@@ -98,6 +116,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		ApprovalService:         approvalService,
 		ToolRegistry:            registry,
 		MCPService:              mcpService,
+		PluginService:           pluginService,
 		LoadedConfig:            cfg,
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
@@ -248,7 +267,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	configReq.AddCookie(sessionCookie)
 	configRes := httptest.NewRecorder()
 	mux.ServeHTTP(configRes, configReq)
-	if configRes.Code != http.StatusOK || !strings.Contains(configRes.Body.String(), `"mcp_servers"`) || !strings.Contains(configRes.Body.String(), `"mcp_lookup"`) {
+	if configRes.Code != http.StatusOK || !strings.Contains(configRes.Body.String(), `"mcp_servers"`) || !strings.Contains(configRes.Body.String(), `"mcp_lookup"`) || !strings.Contains(configRes.Body.String(), `"plugins"`) || !strings.Contains(configRes.Body.String(), `"dashboard-kit"`) {
 		t.Fatalf("expected config api to expose mcp inspection data, got %d %s", configRes.Code, configRes.Body.String())
 	}
 

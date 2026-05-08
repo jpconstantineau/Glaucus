@@ -16,6 +16,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/memory"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
+	"github.com/jpconstantineau/Glaucus/internal/plugins"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	agentruntime "github.com/jpconstantineau/Glaucus/internal/runtime"
@@ -50,6 +51,7 @@ type Runtime struct {
 	skills     *skills.Service
 	exports    *exportsvc.Service
 	mcp        *mcp.Service
+	plugins    *plugins.Service
 	curator    *skills.Curator
 	metrics    *observability.Service
 	scheduler  *jobs.Scheduler
@@ -134,6 +136,10 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	if err := runtime.mcp.Reconcile(context.Background(), loadedConfig.Config, runtime.tools); err != nil {
 		return nil, fmt.Errorf("reconcile mcp config: %w", err)
 	}
+	runtime.plugins = plugins.NewService(pb)
+	if err := runtime.plugins.Reconcile(context.Background(), activeProfile.Root, loadedConfig.Config.Plugins); err != nil {
+		return nil, fmt.Errorf("reconcile plugins: %w", err)
+	}
 	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
 	pollInterval, err := time.ParseDuration(loadedConfig.Config.Cron.PollInterval)
@@ -170,6 +176,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		SkillsService:           runtime.skills,
 		ExportService:           runtime.exports,
 		MCPService:              runtime.mcp,
+		PluginService:           runtime.plugins,
 		ObservabilityService:    runtime.metrics,
 		Scheduler:               runtime.scheduler,
 		EventService:            runtime.events,

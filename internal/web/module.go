@@ -22,6 +22,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/mcp"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
+	"github.com/jpconstantineau/Glaucus/internal/plugins"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
@@ -53,6 +54,7 @@ type Options struct {
 	SkillsService           *skills.Service
 	ExportService           *exportsvc.Service
 	MCPService              *mcp.Service
+	PluginService           *plugins.Service
 	ObservabilityService    *observability.Service
 	Scheduler               *jobs.Scheduler
 	EventService            *runtime.EventService
@@ -725,6 +727,15 @@ func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error 
 			}
 		}
 	}
+	pluginList := []any{}
+	if m.options.PluginService != nil {
+		if items, err := m.options.PluginService.ListPlugins(e.Request.Context(), 50); err == nil {
+			pluginList = make([]any, 0, len(items))
+			for _, item := range items {
+				pluginList = append(pluginList, item)
+			}
+		}
+	}
 	return e.JSON(http.StatusOK, map[string]any{
 		"model": map[string]any{
 			"default_provider": m.options.LoadedConfig.Model.DefaultProvider,
@@ -742,6 +753,7 @@ func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error 
 			"root": m.options.Profile.Root,
 		},
 		"mcp_servers": mcpServers,
+		"plugins":     pluginList,
 	})
 }
 
