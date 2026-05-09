@@ -43,6 +43,8 @@ func TestRunAllMigrationsCreatesCoreCollectionsAndIsIdempotent(t *testing.T) {
 		"agent_messages",
 		"agent_runs",
 		"agent_run_events",
+		"session_goals",
+		"profile_goals",
 		"approval_requests",
 		"cron_jobs",
 		"cron_job_runs",
