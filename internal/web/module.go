@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/kanban"
 	"github.com/jpconstantineau/Glaucus/internal/messaging"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
@@ -50,6 +52,8 @@ type Options struct {
 	ProviderCatalog         providers.Catalog
 	SessionService          *sessions.Service
 	JobService              *jobs.Service
+	KanbanService           *kanban.Service
+	QueueManager            *kanban.QueueManager
 	SearchService           *search.Service
 	MessagingGateway        *messaging.Gateway
 	SkillsService           *skills.Service
@@ -108,6 +112,14 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/dashboard/approvals", m.withOperatorAuth(m.approvalsPage))
 	rg.POST("/dashboard/approvals/{approvalID}/decision", m.withOperatorAuth(m.approvalDecisionSubmit))
 	rg.GET("/dashboard/tools", m.withOperatorAuth(m.toolsPage))
+	rg.GET("/dashboard/kanban", m.withOperatorAuth(m.kanbanPage))
+	rg.POST("/dashboard/kanban/boards", m.withOperatorAuth(m.kanbanBoardSubmit))
+	rg.POST("/dashboard/kanban/tasks", m.withOperatorAuth(m.kanbanTaskSubmit))
+	rg.POST("/dashboard/kanban/tasks/{taskID}/save", m.withOperatorAuth(m.kanbanTaskSaveSubmit))
+	rg.POST("/dashboard/kanban/tasks/{taskID}/dispatch", m.withOperatorAuth(m.kanbanTaskDispatchSubmit))
+	rg.POST("/dashboard/kanban/tasks/{taskID}/retry", m.withOperatorAuth(m.kanbanTaskRetrySubmit))
+	rg.POST("/dashboard/kanban/tasks/{taskID}/cancel", m.withOperatorAuth(m.kanbanTaskCancelSubmit))
+	rg.POST("/dashboard/kanban/tasks/{taskID}/comments", m.withOperatorAuth(m.kanbanCommentSubmit))
 	rg.GET("/chat", m.withOperatorAuth(m.chatPage))
 	rg.GET("/chat/transcript", m.withOperatorAuth(m.chatTranscript))
 	rg.POST("/chat/send", m.withOperatorAuth(m.chatSend))
@@ -271,6 +283,8 @@ func (m *Module) dashboardShell(e *core.RequestEvent, operator *core.Record) err
 		ProfileSlug      string
 		ProviderCount    int
 		PendingApprovals int
+		KanbanBoards     int
+		ActiveQueueTasks int
 		CSRF             string
 	}{
 		AppName:          m.options.AppName,
@@ -278,6 +292,8 @@ func (m *Module) dashboardShell(e *core.RequestEvent, operator *core.Record) err
 		ProfileSlug:      m.options.Profile.Slug,
 		ProviderCount:    len(m.options.ProviderCatalog.Entries),
 		PendingApprovals: m.pendingApprovalCount(e.Request.Context()),
+		KanbanBoards:     m.kanbanBoardCount(e.Request.Context()),
+		ActiveQueueTasks: m.kanbanActiveTaskCount(e.Request.Context()),
 		CSRF:             csrfToken,
 	}
 
@@ -765,6 +781,229 @@ func (m *Module) logsPage(e *core.RequestEvent, _ *core.Record) error {
 		Current: selected,
 		Content: content,
 	}))
+}
+
+func (m *Module) kanbanPage(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.KanbanService == nil {
+		return e.InternalServerError("kanban service unavailable", nil)
+	}
+	csrfToken, err := ensureCSRFCookie(e)
+	if err != nil {
+		return e.InternalServerError("failed to create kanban form", err)
+	}
+	boards, err := m.options.KanbanService.ListBoards(e.Request.Context(), m.options.Profile.Slug, 100)
+	if err != nil {
+		return e.InternalServerError("failed to list boards", err)
+	}
+	boardViews := make([]kanbanBoardView, 0, len(boards))
+	for _, board := range boards {
+		tasks, err := m.options.KanbanService.ListTasksByBoard(e.Request.Context(), board.ID)
+		if err != nil {
+			return e.InternalServerError("failed to list board tasks", err)
+		}
+		taskViews := make([]kanbanTaskView, 0, len(tasks))
+		for _, task := range tasks {
+			comments, err := m.options.KanbanService.ListCommentsByTask(e.Request.Context(), task.ID)
+			if err != nil {
+				return e.InternalServerError("failed to load task comments", err)
+			}
+			taskViews = append(taskViews, kanbanTaskView{Task: task, Comments: comments})
+		}
+		boardViews = append(boardViews, kanbanBoardView{Board: board, Tasks: taskViews})
+	}
+	return e.HTML(http.StatusOK, kanbanTemplate(kanbanPageData{
+		AppName:         m.options.AppName,
+		CSRF:            csrfToken,
+		Boards:          boardViews,
+		Models:          m.modelOptions(),
+		SelectedModel:   defaultModelRef(m.options.LoadedConfig),
+		Toolsets:        m.toolsetOptions(),
+		SelectedToolset: m.defaultToolset(),
+		StatusOptions:   []string{kanban.TaskStatusBacklog, kanban.TaskStatusReady, kanban.TaskStatusInProgress, kanban.TaskStatusReview, kanban.TaskStatusDone, kanban.TaskStatusCancelled},
+		PriorityOptions: []string{"low", "normal", "high", "urgent"},
+	}))
+}
+
+func (m *Module) kanbanBoardSubmit(e *core.RequestEvent, operator *core.Record) error {
+	if m.options.KanbanService == nil {
+		return e.InternalServerError("kanban service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	wipLimit, _ := strconv.Atoi(strings.TrimSpace(e.Request.FormValue("wip_limit")))
+	board, err := m.options.KanbanService.CreateBoard(e.Request.Context(), kanban.CreateBoardInput{
+		ProfileID:   m.options.Profile.Slug,
+		Name:        e.Request.FormValue("name"),
+		Description: e.Request.FormValue("description"),
+		Status:      kanban.BoardStatusActive,
+		Owner:       operator.Email(),
+		WIPLimit:    wipLimit,
+	})
+	if err != nil {
+		return e.InternalServerError("failed to create board", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/kanban?board="+url.QueryEscape(board.ID))
+}
+
+func (m *Module) kanbanTaskSubmit(e *core.RequestEvent, operator *core.Record) error {
+	if m.options.KanbanService == nil {
+		return e.InternalServerError("kanban service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	position, _ := strconv.Atoi(strings.TrimSpace(e.Request.FormValue("position")))
+	boardID := strings.TrimSpace(e.Request.FormValue("board_id"))
+	task, err := m.options.KanbanService.CreateTask(e.Request.Context(), kanban.CreateTaskInput{
+		ProfileID:        m.options.Profile.Slug,
+		BoardID:          boardID,
+		Title:            e.Request.FormValue("title"),
+		Description:      e.Request.FormValue("description"),
+		Status:           fallbackString(e.Request.FormValue("status"), kanban.TaskStatusBacklog),
+		QueueState:       kanban.QueueStateIdle,
+		Priority:         fallbackString(e.Request.FormValue("priority"), "normal"),
+		Position:         position,
+		Owner:            operator.Email(),
+		Assignee:         e.Request.FormValue("assignee"),
+		ParentRunID:      e.Request.FormValue("parent_run_id"),
+		DelegationPrompt: e.Request.FormValue("delegation_prompt"),
+	})
+	if err != nil {
+		return e.InternalServerError("failed to create task", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/kanban?board="+url.QueryEscape(task.BoardID))
+}
+
+func (m *Module) kanbanTaskSaveSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.KanbanService == nil {
+		return e.InternalServerError("kanban service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	taskID := e.Request.PathValue("taskID")
+	position, _ := strconv.Atoi(strings.TrimSpace(e.Request.FormValue("position")))
+	task, err := m.options.KanbanService.GetTask(e.Request.Context(), taskID)
+	if err != nil {
+		return e.InternalServerError("failed to load task", err)
+	}
+	updated, err := m.options.KanbanService.UpdateTask(e.Request.Context(), taskID, kanban.UpdateTaskInput{
+		Description:      e.Request.FormValue("description"),
+		Status:           fallbackString(e.Request.FormValue("status"), task.Status),
+		Priority:         fallbackString(e.Request.FormValue("priority"), task.Priority),
+		Position:         &position,
+		Assignee:         e.Request.FormValue("assignee"),
+		ParentRunID:      e.Request.FormValue("parent_run_id"),
+		DelegationPrompt: e.Request.FormValue("delegation_prompt"),
+	})
+	if err != nil {
+		return e.InternalServerError("failed to update task", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/kanban?board="+url.QueryEscape(updated.BoardID))
+}
+
+func (m *Module) kanbanTaskDispatchSubmit(e *core.RequestEvent, operator *core.Record) error {
+	if m.options.KanbanService == nil || m.options.QueueManager == nil {
+		return e.InternalServerError("kanban queue unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	taskID := e.Request.PathValue("taskID")
+	task, err := m.options.KanbanService.GetTask(e.Request.Context(), taskID)
+	if err != nil {
+		return e.InternalServerError("failed to load task", err)
+	}
+	providerID, modelID := splitModelRef(e.Request.FormValue("model"), m.options.LoadedConfig)
+	toolset := fallbackString(e.Request.FormValue("toolset"), m.defaultToolset())
+	if _, err := m.options.QueueManager.DispatchTaskRun(e.Request.Context(), kanban.DispatchInput{
+		TaskID:           taskID,
+		Actor:            operator.Email(),
+		ParentRunID:      e.Request.FormValue("parent_run_id"),
+		ProviderID:       providerID,
+		ModelID:          modelID,
+		Prompt:           e.Request.FormValue("delegation_prompt"),
+		ApprovalMode:     m.options.LoadedConfig.Approvals.Mode,
+		ToolResolution:   m.resolveToolset(e.Request.Context(), toolset),
+		WorkingDirectory: m.options.Profile.Root,
+	}); err != nil {
+		return e.InternalServerError("failed to dispatch task", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/kanban?board="+url.QueryEscape(task.BoardID))
+}
+
+func (m *Module) kanbanTaskRetrySubmit(e *core.RequestEvent, operator *core.Record) error {
+	if m.options.KanbanService == nil || m.options.QueueManager == nil {
+		return e.InternalServerError("kanban queue unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	taskID := e.Request.PathValue("taskID")
+	task, err := m.options.KanbanService.GetTask(e.Request.Context(), taskID)
+	if err != nil {
+		return e.InternalServerError("failed to load task", err)
+	}
+	providerID, modelID := splitModelRef(e.Request.FormValue("model"), m.options.LoadedConfig)
+	toolset := fallbackString(e.Request.FormValue("toolset"), m.defaultToolset())
+	if _, err := m.options.QueueManager.RetryTaskRun(e.Request.Context(), kanban.DispatchInput{
+		TaskID:           taskID,
+		Actor:            operator.Email(),
+		ParentRunID:      e.Request.FormValue("parent_run_id"),
+		ProviderID:       providerID,
+		ModelID:          modelID,
+		Prompt:           e.Request.FormValue("delegation_prompt"),
+		ApprovalMode:     m.options.LoadedConfig.Approvals.Mode,
+		ToolResolution:   m.resolveToolset(e.Request.Context(), toolset),
+		WorkingDirectory: m.options.Profile.Root,
+	}); err != nil {
+		return e.InternalServerError("failed to retry task", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/kanban?board="+url.QueryEscape(task.BoardID))
+}
+
+func (m *Module) kanbanTaskCancelSubmit(e *core.RequestEvent, operator *core.Record) error {
+	if m.options.KanbanService == nil || m.options.QueueManager == nil {
+		return e.InternalServerError("kanban queue unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	taskID := e.Request.PathValue("taskID")
+	task, err := m.options.KanbanService.GetTask(e.Request.Context(), taskID)
+	if err != nil {
+		return e.InternalServerError("failed to load task", err)
+	}
+	if _, _, err := m.options.QueueManager.CancelTaskRun(e.Request.Context(), taskID, operator.Email()); err != nil {
+		return e.InternalServerError("failed to cancel task", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/kanban?board="+url.QueryEscape(task.BoardID))
+}
+
+func (m *Module) kanbanCommentSubmit(e *core.RequestEvent, operator *core.Record) error {
+	if m.options.KanbanService == nil {
+		return e.InternalServerError("kanban service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	taskID := e.Request.PathValue("taskID")
+	task, err := m.options.KanbanService.GetTask(e.Request.Context(), taskID)
+	if err != nil {
+		return e.InternalServerError("failed to load task", err)
+	}
+	if _, err := m.options.KanbanService.AddComment(e.Request.Context(), kanban.AddCommentInput{
+		ProfileID: m.options.Profile.Slug,
+		BoardID:   task.BoardID,
+		TaskID:    task.ID,
+		Author:    operator.Email(),
+		Kind:      kanban.CommentKindNote,
+		Body:      e.Request.FormValue("comment"),
+	}); err != nil {
+		return e.InternalServerError("failed to add comment", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/kanban?board="+url.QueryEscape(task.BoardID))
 }
 
 func (m *Module) versionInfo(e *core.RequestEvent, _ *core.Record) error {
@@ -1348,12 +1587,20 @@ var dashboardPageTmpl = template.Must(template.New("dashboard").Parse(`<!doctype
         <div class="label">Pending Approvals</div>
         <div class="value">{{.PendingApprovals}}</div>
       </article>
+      <article class="card">
+        <div class="label">Kanban Boards</div>
+        <div class="value">{{.KanbanBoards}}</div>
+      </article>
+      <article class="card">
+        <div class="label">Active Queue Tasks</div>
+        <div class="value">{{.ActiveQueueTasks}}</div>
+      </article>
     </section>
     <section class="panel">
       <h2>Operator Console</h2>
       <p>Open the operator status page at <a href="/dashboard/status">/dashboard/status</a>, the browser chat at <a href="/chat">/chat</a>, and the sessions explorer at <a href="/dashboard/sessions">/dashboard/sessions</a>.</p>
       <p>Inspect run detail from <a href="/dashboard/runs/">/dashboard/runs/&lt;runID&gt;</a>, cron jobs at <a href="/dashboard/jobs">/dashboard/jobs</a>, messaging adapters at <a href="/dashboard/adapters">/dashboard/adapters</a>, skills at <a href="/dashboard/skills">/dashboard/skills</a>, and logs at <a href="/dashboard/logs">/dashboard/logs</a>.</p>
-      <p>Review approval requests at <a href="/dashboard/approvals">/dashboard/approvals</a> and inspect effective tool availability at <a href="/dashboard/tools">/dashboard/tools</a>.</p>
+      <p>Review approval requests at <a href="/dashboard/approvals">/dashboard/approvals</a>, inspect effective tool availability at <a href="/dashboard/tools">/dashboard/tools</a>, and manage delegated work from <a href="/dashboard/kanban">/dashboard/kanban</a>.</p>
       <p>Machine-readable endpoints: <a href="/health">/health</a>, <a href="/health/detailed">/health/detailed</a>, <a href="/api/version">/api/version</a>.</p>
     </section>
   </main>
@@ -1675,6 +1922,28 @@ type toolsPageData struct {
 	WebAdmin tools.Resolution
 }
 
+type kanbanPageData struct {
+	AppName         string
+	CSRF            string
+	Boards          []kanbanBoardView
+	Models          []modelOption
+	SelectedModel   string
+	Toolsets        []string
+	SelectedToolset string
+	StatusOptions   []string
+	PriorityOptions []string
+}
+
+type kanbanBoardView struct {
+	Board kanban.Board
+	Tasks []kanbanTaskView
+}
+
+type kanbanTaskView struct {
+	Task     kanban.Task
+	Comments []kanban.Comment
+}
+
 type adaptersPageData struct {
 	AppName         string
 	CSRF            string
@@ -1751,6 +2020,28 @@ func (m *Module) pendingApprovalCount(ctx context.Context) int {
 		return 0
 	}
 	return len(requests)
+}
+
+func (m *Module) kanbanBoardCount(ctx context.Context) int {
+	if m.options.KanbanService == nil {
+		return 0
+	}
+	items, err := m.options.KanbanService.ListBoards(ctx, m.options.Profile.Slug, 100)
+	if err != nil {
+		return 0
+	}
+	return len(items)
+}
+
+func (m *Module) kanbanActiveTaskCount(ctx context.Context) int {
+	if m.options.KanbanService == nil {
+		return 0
+	}
+	items, err := m.options.KanbanService.ListActiveTasks(ctx, m.options.Profile.Slug, 100)
+	if err != nil {
+		return 0
+	}
+	return len(items)
 }
 
 func (m *Module) schedulerStatus() jobs.SchedulerStatus {
@@ -1878,6 +2169,165 @@ func approvalsTemplate(data approvalsPageData) string {
 func toolsTemplate(data toolsPageData) string {
 	var sb strings.Builder
 	_ = toolsPageTmpl.Execute(&sb, data)
+	return sb.String()
+}
+
+var kanbanPageTmpl = template.Must(template.New("kanban").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Kanban</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 84rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    .board { border: 1px solid #d9e2ec; border-radius: .95rem; padding: 1rem; margin-top: 1rem; }
+    .task { border: 1px solid #bcccdc; border-radius: .85rem; padding: .9rem; margin-top: .9rem; background: #f8fbfc; }
+    .comment { border-left: 3px solid #0f766e; padding-left: .65rem; margin-top: .65rem; color: #334e68; }
+    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); }
+    .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
+    form { display: grid; gap: .65rem; margin-top: .75rem; }
+    input, textarea, select, button { font: inherit; }
+    input, textarea, select { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; box-sizing: border-box; }
+    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
+    .subtle { background: #486581; }
+    .danger { background: #b42318; }
+    .meta { color: #52606d; font-size: .95rem; }
+    code { background: #eef2f6; padding: .1rem .35rem; border-radius: .4rem; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Kanban Queue</h1>
+    <p><a href="/dashboard">Back to dashboard</a></p>
+    <div class="grid">
+      <form method="post" action="/dashboard/kanban/boards">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <h2>Create Board</h2>
+        <input type="text" name="name" placeholder="Board name" required>
+        <textarea name="description" rows="3" placeholder="Why this board exists"></textarea>
+        <input type="number" name="wip_limit" min="0" placeholder="WIP limit">
+        <button type="submit">Create Board</button>
+      </form>
+      <form method="post" action="/dashboard/kanban/tasks">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <h2>Create Task</h2>
+        <select name="board_id" required>
+          <option value="">Select board</option>
+          {{range .Boards}}
+            <option value="{{.Board.ID}}">{{.Board.Name}}</option>
+          {{end}}
+        </select>
+        <input type="text" name="title" placeholder="Task title" required>
+        <textarea name="description" rows="3" placeholder="Task detail"></textarea>
+        <textarea name="delegation_prompt" rows="3" placeholder="Delegation prompt used when dispatching"></textarea>
+        <div class="row">
+          <input type="text" name="assignee" placeholder="Assignee">
+          <input type="text" name="parent_run_id" placeholder="Optional parent run id">
+        </div>
+        <div class="row">
+          <select name="status">
+            {{range .StatusOptions}}
+              <option value="{{.}}">{{.}}</option>
+            {{end}}
+          </select>
+          <select name="priority">
+            {{range .PriorityOptions}}
+              <option value="{{.}}">{{.}}</option>
+            {{end}}
+          </select>
+          <input type="number" name="position" min="0" placeholder="Position">
+        </div>
+        <button type="submit">Create Task</button>
+      </form>
+    </div>
+    {{range .Boards}}
+      <article class="board">
+        <h2>{{.Board.Name}}</h2>
+        <div class="meta">Slug: {{.Board.Slug}} | Status: {{.Board.Status}} | Owner: {{if .Board.Owner}}{{.Board.Owner}}{{else}}unassigned{{end}} | WIP: {{.Board.WIPLimit}}</div>
+        <p>{{if .Board.Description}}{{.Board.Description}}{{else}}No board description yet.{{end}}</p>
+        {{range .Tasks}}
+          <article class="task">
+            {{$task := .Task}}
+            <strong>{{.Task.Title}}</strong>
+            <div class="meta">Status: {{.Task.Status}} | Queue: {{.Task.QueueState}} | Priority: {{.Task.Priority}} | Retry: {{.Task.RetryCount}} | Assignee: {{if .Task.Assignee}}{{.Task.Assignee}}{{else}}unassigned{{end}}</div>
+            <div class="meta">Session: {{if .Task.SessionID}}<code>{{.Task.SessionID}}</code>{{else}}none{{end}} | Latest run: {{if .Task.LatestRunID}}<a href="/dashboard/runs/{{.Task.LatestRunID}}">{{.Task.LatestRunID}}</a>{{else}}none{{end}}</div>
+            <div class="meta">Parent run: {{if .Task.ParentRunID}}<code>{{.Task.ParentRunID}}</code>{{else}}none{{end}} | Last error: {{if .Task.LastError}}{{.Task.LastError}}{{else}}none{{end}}</div>
+            <p>{{if .Task.Description}}{{.Task.Description}}{{else}}No task description yet.{{end}}</p>
+            <form method="post" action="/dashboard/kanban/tasks/{{.Task.ID}}/save">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <textarea name="description" rows="3">{{.Task.Description}}</textarea>
+              <textarea name="delegation_prompt" rows="3">{{.Task.DelegationPrompt}}</textarea>
+              <div class="row">
+                <select name="status">
+                  {{range $.StatusOptions}}
+                    <option value="{{.}}" {{if eq . $task.Status}}selected{{end}}>{{.}}</option>
+                  {{end}}
+                </select>
+                <select name="priority">
+                  {{range $.PriorityOptions}}
+                    <option value="{{.}}" {{if eq . $task.Priority}}selected{{end}}>{{.}}</option>
+                  {{end}}
+                </select>
+                <input type="number" name="position" min="0" value="{{.Task.Position}}">
+              </div>
+              <div class="row">
+                <input type="text" name="assignee" value="{{.Task.Assignee}}" placeholder="Assignee">
+                <input type="text" name="parent_run_id" value="{{.Task.ParentRunID}}" placeholder="Parent run id">
+              </div>
+              <button type="submit" class="subtle">Save Task</button>
+            </form>
+            <form method="post" action="/dashboard/kanban/tasks/{{.Task.ID}}/dispatch">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="parent_run_id" value="{{.Task.ParentRunID}}">
+              <textarea name="delegation_prompt" rows="2" placeholder="Optional override prompt">{{.Task.DelegationPrompt}}</textarea>
+              <div class="row">
+                <select name="model">
+                  {{range $.Models}}
+                    <option value="{{.Ref}}" {{if eq .Ref $.SelectedModel}}selected{{end}}>{{.Label}}</option>
+                  {{end}}
+                </select>
+                <select name="toolset">
+                  {{range $.Toolsets}}
+                    <option value="{{.}}" {{if eq . $.SelectedToolset}}selected{{end}}>{{.}}</option>
+                  {{end}}
+                </select>
+              </div>
+              <div class="row">
+                <button type="submit">Dispatch</button>
+                <button type="submit" formaction="/dashboard/kanban/tasks/{{.Task.ID}}/retry" class="subtle">Retry</button>
+                <button type="submit" formaction="/dashboard/kanban/tasks/{{.Task.ID}}/cancel" class="danger">Cancel</button>
+              </div>
+            </form>
+            <form method="post" action="/dashboard/kanban/tasks/{{.Task.ID}}/comments">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <textarea name="comment" rows="2" placeholder="Add a note or operator handoff"></textarea>
+              <button type="submit" class="subtle">Add Comment</button>
+            </form>
+            <h3>Comments</h3>
+            {{range .Comments}}
+              <div class="comment">
+                <strong>{{.Author}}</strong> | {{.Kind}}{{if .RunID}} | run <a href="/dashboard/runs/{{.RunID}}">{{.RunID}}</a>{{end}}
+                <div>{{.Body}}</div>
+              </div>
+            {{else}}
+              <p class="meta">No comments yet.</p>
+            {{end}}
+          </article>
+        {{else}}
+          <p class="meta">No tasks on this board yet.</p>
+        {{end}}
+      </article>
+    {{else}}
+      <p>No boards yet. Create one to start dispatching delegated work.</p>
+    {{end}}
+  </section>
+</body>
+</html>`))
+
+func kanbanTemplate(data kanbanPageData) string {
+	var sb strings.Builder
+	_ = kanbanPageTmpl.Execute(&sb, data)
 	return sb.String()
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/kanban"
 	"github.com/jpconstantineau/Glaucus/internal/memory"
 	"github.com/jpconstantineau/Glaucus/internal/messaging"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
@@ -45,6 +46,8 @@ type Runtime struct {
 	providers  providers.Catalog
 	sessions   *sessions.Service
 	jobs       *jobs.Service
+	kanban     *kanban.Service
+	queue      *kanban.QueueManager
 	memory     *memory.Service
 	messaging  *messaging.Gateway
 	search     *search.Service
@@ -113,6 +116,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	}
 	runtime.sessions = sessions.NewService(pb)
 	runtime.jobs = jobs.NewService(pb)
+	runtime.kanban = kanban.NewService(pb)
 	runtime.memory = memory.NewService(pb)
 	runtime.messaging = messaging.NewGateway(pb, runtime.sessions)
 	runtime.messaging.Register(messaging.NewTelegramAdapter(messaging.TelegramConfig{
@@ -146,6 +150,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	tools.RegisterSkillsTools(runtime.tools, skillsToolAdapter{service: runtime.skills, profileRoot: activeProfile.Root})
 	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
+	runtime.queue = kanban.NewQueueManager(runtime.kanban, runtime.sessions, runtime.runs)
 	pollInterval, err := time.ParseDuration(loadedConfig.Config.Cron.PollInterval)
 	if err != nil || pollInterval <= 0 {
 		pollInterval = time.Minute
@@ -176,6 +181,8 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		ProviderCatalog:         catalog,
 		SessionService:          runtime.sessions,
 		JobService:              runtime.jobs,
+		KanbanService:           runtime.kanban,
+		QueueManager:            runtime.queue,
 		SearchService:           runtime.search,
 		MessagingGateway:        runtime.messaging,
 		SkillsService:           runtime.skills,

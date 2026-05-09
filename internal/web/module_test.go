@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	"github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/kanban"
 	"github.com/jpconstantineau/Glaucus/internal/messaging"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
@@ -48,6 +50,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		t.Fatalf("ensure operator: %v", err)
 	}
 	approvalService := approvals.NewService(app, config.Default().Approvals)
+	kanbanService := kanban.NewService(app)
 
 	router, err := apis.NewRouter(app)
 	if err != nil {
@@ -65,6 +68,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		ProviderCatalog: providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1"}}},
 		SessionService:  sessions.NewService(app),
 		JobService:      jobs.NewService(app),
+		KanbanService:   kanbanService,
 		SearchService:   search.NewService(app, sessions.NewService(app)),
 		MessagingGateway: func() *messaging.Gateway {
 			gateway := messaging.NewGateway(app, sessions.NewService(app))
@@ -92,6 +96,12 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 			tools.RegisterFileTools(r)
 			return r
 		}(), nil),
+		QueueManager: kanban.NewQueueManager(kanbanService, sessions.NewService(app), runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, config.Default()), runtime.NewEventService(app), func() *tools.Registry {
+			r := tools.NewRegistry()
+			tools.RegisterCatalogDefaults(r)
+			tools.RegisterFileTools(r)
+			return r
+		}(), nil)),
 		ApprovalService: approvalService,
 		ToolRegistry: func() *tools.Registry {
 			r := tools.NewRegistry()
@@ -232,6 +242,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		"/dashboard/adapters",
 		"/dashboard/skills",
 		"/dashboard/logs",
+		"/dashboard/kanban",
 		"/api/dashboard/status",
 		"/api/dashboard/config",
 		"/api/dashboard/providers",
@@ -474,5 +485,222 @@ func TestApprovalsPageRendersPendingRequest(t *testing.T) {
 	}
 	if !strings.Contains(res.Body.String(), "Approvals Queue") || !strings.Contains(res.Body.String(), "write_file") {
 		t.Fatalf("expected approvals page to show pending request, got %s", res.Body.String())
+	}
+}
+
+func TestKanbanDashboardDispatchAndCommentFlow(t *testing.T) {
+	app := core.NewBaseApp(core.BaseAppConfig{
+		DataDir:       t.TempDir(),
+		EncryptionEnv: "GLAUCUS_TEST_ENCRYPTION_KEY",
+	})
+	t.Setenv("GLAUCUS_TEST_ENCRYPTION_KEY", "12345678901234567890123456789012")
+	t.Cleanup(func() {
+		_ = app.ResetBootstrapState()
+	})
+
+	if err := app.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap app: %v", err)
+	}
+	if err := app.RunAllMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	if err := EnsureDefaultOperator(app, "admin@glaucus.local", "glaucus-admin"); err != nil {
+		t.Fatalf("ensure operator: %v", err)
+	}
+
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model": "m1",
+			"choices": []map[string]any{{
+				"finish_reason": "stop",
+				"message":       map[string]any{"content": "delegated queue run complete"},
+			}},
+		})
+	}))
+	defer providerServer.Close()
+
+	router, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatalf("new router: %v", err)
+	}
+
+	sessionService := sessions.NewService(app)
+	eventService := runtime.NewEventService(app)
+	orchestrator := runtime.NewOrchestrator(sessionService, providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{
+		ProviderID:   "one",
+		ModelID:      "m1",
+		Dialect:      "openai-chat",
+		BaseURL:      providerServer.URL,
+		DisplayName:  "Model One",
+		Capabilities: []string{"chat"},
+	}}}, config.Default()), eventService, func() *tools.Registry {
+		r := tools.NewRegistry()
+		tools.RegisterCatalogDefaults(r)
+		tools.RegisterFileTools(r)
+		return r
+	}(), nil)
+	kanbanService := kanban.NewService(app)
+
+	module := &Module{options: Options{
+		AppName:         "Glaucus",
+		Version:         "dev",
+		Commit:          "local",
+		BuiltAt:         "now",
+		BindAddress:     "127.0.0.1:8090",
+		SessionTTL:      24 * time.Hour,
+		Profile:         profile.ActiveProfile{Slug: "default", Root: t.TempDir()},
+		ProviderCatalog: providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", DisplayName: "Model One"}}},
+		SessionService:  sessionService,
+		JobService:      jobs.NewService(app),
+		KanbanService:   kanbanService,
+		QueueManager:    kanban.NewQueueManager(kanbanService, sessionService, orchestrator),
+		EventService:    eventService,
+		Orchestrator:    orchestrator,
+		ToolRegistry: func() *tools.Registry {
+			r := tools.NewRegistry()
+			tools.RegisterCatalogDefaults(r)
+			tools.RegisterFileTools(r)
+			return r
+		}(),
+		LoadedConfig: config.Config{
+			Model:     config.ModelConfig{DefaultProvider: "one", DefaultModel: "m1"},
+			Web:       config.Default().Web,
+			Cron:      config.Default().Cron,
+			Approvals: config.Default().Approvals,
+		},
+		DefaultOperatorEmail:    "admin@glaucus.local",
+		DefaultOperatorPassword: "glaucus-admin",
+	}}
+	module.BindRoutes(app, router)
+
+	mux, err := router.BuildMux()
+	if err != nil {
+		t.Fatalf("build mux: %v", err)
+	}
+
+	loginPageReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/login", nil)
+	loginPageReq.Host = "127.0.0.1:8090"
+	loginPageRes := httptest.NewRecorder()
+	mux.ServeHTTP(loginPageRes, loginPageReq)
+	csrfCookie := loginPageRes.Result().Cookies()[0]
+	csrfToken := extractValue(loginPageRes.Body.String(), `name="csrf" value="`, `"`)
+
+	loginForm := url.Values{
+		"csrf":     {csrfToken},
+		"email":    {"admin@glaucus.local"},
+		"password": {"glaucus-admin"},
+	}
+	loginReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8090/login", strings.NewReader(loginForm.Encode()))
+	loginReq.Host = "127.0.0.1:8090"
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginReq.AddCookie(csrfCookie)
+	loginRes := httptest.NewRecorder()
+	mux.ServeHTTP(loginRes, loginReq)
+
+	var sessionCookie *http.Cookie
+	for _, cookie := range loginRes.Result().Cookies() {
+		if cookie.Name == sessionCookieName {
+			sessionCookie = cookie
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("expected session cookie after login")
+	}
+
+	createBoardForm := url.Values{
+		"csrf":        {csrfToken},
+		"name":        {"Slice 8 Board"},
+		"description": {"Dashboard board"},
+		"wip_limit":   {"2"},
+	}
+	createBoardReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8090/dashboard/kanban/boards", strings.NewReader(createBoardForm.Encode()))
+	createBoardReq.Host = "127.0.0.1:8090"
+	createBoardReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	createBoardReq.AddCookie(sessionCookie)
+	createBoardReq.AddCookie(csrfCookie)
+	createBoardRes := httptest.NewRecorder()
+	mux.ServeHTTP(createBoardRes, createBoardReq)
+	if createBoardRes.Code != http.StatusSeeOther {
+		t.Fatalf("expected board redirect, got %d", createBoardRes.Code)
+	}
+
+	boards, err := kanbanService.ListBoards(t.Context(), "default", 10)
+	if err != nil || len(boards) != 1 {
+		t.Fatalf("expected created board, got %#v err=%v", boards, err)
+	}
+
+	createTaskForm := url.Values{
+		"csrf":              {csrfToken},
+		"board_id":          {boards[0].ID},
+		"title":             {"Investigate worker backlog"},
+		"description":       {"Open the queue and summarize run linkage."},
+		"delegation_prompt": {"Inspect the task board and report current blockers."},
+		"status":            {kanban.TaskStatusReady},
+		"priority":          {"high"},
+		"position":          {"10"},
+	}
+	createTaskReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8090/dashboard/kanban/tasks", strings.NewReader(createTaskForm.Encode()))
+	createTaskReq.Host = "127.0.0.1:8090"
+	createTaskReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	createTaskReq.AddCookie(sessionCookie)
+	createTaskReq.AddCookie(csrfCookie)
+	createTaskRes := httptest.NewRecorder()
+	mux.ServeHTTP(createTaskRes, createTaskReq)
+	if createTaskRes.Code != http.StatusSeeOther {
+		t.Fatalf("expected task redirect, got %d", createTaskRes.Code)
+	}
+
+	tasks, err := kanbanService.ListTasksByBoard(t.Context(), boards[0].ID)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("expected created task, got %#v err=%v", tasks, err)
+	}
+
+	dispatchForm := url.Values{
+		"csrf":              {csrfToken},
+		"model":             {"one/m1"},
+		"toolset":           {tools.SurfaceWebChat},
+		"delegation_prompt": {"Inspect the task board and report current blockers."},
+	}
+	dispatchReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8090/dashboard/kanban/tasks/"+tasks[0].ID+"/dispatch", strings.NewReader(dispatchForm.Encode()))
+	dispatchReq.Host = "127.0.0.1:8090"
+	dispatchReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	dispatchReq.AddCookie(sessionCookie)
+	dispatchReq.AddCookie(csrfCookie)
+	dispatchRes := httptest.NewRecorder()
+	mux.ServeHTTP(dispatchRes, dispatchReq)
+	if dispatchRes.Code != http.StatusSeeOther {
+		t.Fatalf("expected dispatch redirect, got %d body=%s", dispatchRes.Code, dispatchRes.Body.String())
+	}
+
+	commentForm := url.Values{
+		"csrf":    {csrfToken},
+		"comment": {"Operator verified the linked run."},
+	}
+	commentReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8090/dashboard/kanban/tasks/"+tasks[0].ID+"/comments", strings.NewReader(commentForm.Encode()))
+	commentReq.Host = "127.0.0.1:8090"
+	commentReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	commentReq.AddCookie(sessionCookie)
+	commentReq.AddCookie(csrfCookie)
+	commentRes := httptest.NewRecorder()
+	mux.ServeHTTP(commentRes, commentReq)
+	if commentRes.Code != http.StatusSeeOther {
+		t.Fatalf("expected comment redirect, got %d", commentRes.Code)
+	}
+
+	pageReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/dashboard/kanban", nil)
+	pageReq.Host = "127.0.0.1:8090"
+	pageReq.AddCookie(sessionCookie)
+	pageReq.AddCookie(csrfCookie)
+	pageRes := httptest.NewRecorder()
+	mux.ServeHTTP(pageRes, pageReq)
+	if pageRes.Code != http.StatusOK {
+		t.Fatalf("expected kanban page, got %d", pageRes.Code)
+	}
+	body := pageRes.Body.String()
+	if !strings.Contains(body, "Slice 8 Board") || !strings.Contains(body, "Investigate worker backlog") {
+		t.Fatalf("expected kanban page to render board and task, got %s", body)
+	}
+	if !strings.Contains(body, "/dashboard/runs/") || !strings.Contains(body, "Operator verified the linked run.") {
+		t.Fatalf("expected kanban page to render run linkage and comment, got %s", body)
 	}
 }
