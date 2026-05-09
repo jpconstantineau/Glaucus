@@ -14,6 +14,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/features"
 	"github.com/jpconstantineau/Glaucus/internal/hooks"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/kanban"
 	"github.com/jpconstantineau/Glaucus/internal/mcp"
 	"github.com/jpconstantineau/Glaucus/internal/memory"
 	"github.com/jpconstantineau/Glaucus/internal/messaging"
@@ -49,6 +50,8 @@ type Runtime struct {
 	providers  providers.Catalog
 	sessions   *sessions.Service
 	jobs       *jobs.Service
+	kanban     *kanban.Service
+	queue      *kanban.QueueManager
 	memory     *memory.Service
 	messaging  *messaging.Gateway
 	search     *search.Service
@@ -120,6 +123,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	}
 	runtime.sessions = sessions.NewService(pb)
 	runtime.jobs = jobs.NewService(pb)
+	runtime.kanban = kanban.NewService(pb)
 	runtime.memory = memory.NewService(pb)
 	runtime.messaging = messaging.NewGateway(pb, runtime.sessions)
 	runtime.messaging.Register(messaging.NewTelegramAdapter(messaging.TelegramConfig{
@@ -156,6 +160,8 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.features = features.NewService(pb)
 	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
+	runtime.queue = kanban.NewQueueManager(runtime.kanban, runtime.sessions, runtime.runs)
+	runtime.runs.SetHooks(hooks.NewBus())
 	runtime.runs.SetHooks(hooks.NewBus())
 	pollInterval, err := time.ParseDuration(loadedConfig.Config.Cron.PollInterval)
 	if err != nil || pollInterval <= 0 {
@@ -187,6 +193,8 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		ProviderCatalog:         catalog,
 		SessionService:          runtime.sessions,
 		JobService:              runtime.jobs,
+		KanbanService:           runtime.kanban,
+		QueueManager:            runtime.queue,
 		SearchService:           runtime.search,
 		MessagingGateway:        runtime.messaging,
 		SkillsService:           runtime.skills,
