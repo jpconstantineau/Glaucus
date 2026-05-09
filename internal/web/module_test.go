@@ -15,6 +15,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	"github.com/jpconstantineau/Glaucus/internal/exports"
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/kanban"
 	"github.com/jpconstantineau/Glaucus/internal/mcp"
@@ -104,6 +105,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		Profile:         profile.ActiveProfile{Slug: "default", Root: profileRoot},
 		ProviderCatalog: providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1"}}},
 		SessionService:  sessions.NewService(app),
+		GoalService:     goals.NewService(app),
 		JobService:      jobs.NewService(app),
 		KanbanService:   kanbanService,
 		SearchService:   search.NewService(app, sessions.NewService(app)),
@@ -259,9 +261,13 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	if !strings.Contains(chatRes.Body.String(), "Tool Activity") {
 		t.Fatalf("expected chat page to render tool activity rail, got %s", chatRes.Body.String())
 	}
+	if !strings.Contains(chatRes.Body.String(), "Goal Context") {
+		t.Fatalf("expected chat page to render goal context, got %s", chatRes.Body.String())
+	}
 
 	for _, path := range []string{
 		"/dashboard/sessions",
+		"/dashboard/goals",
 		"/dashboard/jobs",
 		"/dashboard/adapters",
 		"/dashboard/skills",
@@ -270,6 +276,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		"/api/dashboard/status",
 		"/api/dashboard/config",
 		"/api/dashboard/providers",
+		"/api/dashboard/goals?scope=profile",
 		"/api/dashboard/adapters",
 		"/api/dashboard/secrets",
 		"/api/dashboard/analytics",
@@ -357,6 +364,7 @@ func TestLoginPageReusesExistingCSRFCookie(t *testing.T) {
 		SessionTTL:      24 * time.Hour,
 		Profile:         profile.ActiveProfile{Slug: "default"},
 		ProviderCatalog: providers.Catalog{},
+		GoalService:     goals.NewService(app),
 		ToolRegistry: func() *tools.Registry {
 			r := tools.NewRegistry()
 			tools.RegisterCatalogDefaults(r)
@@ -476,6 +484,7 @@ func TestApprovalsPageRendersPendingRequest(t *testing.T) {
 		SessionTTL:      24 * time.Hour,
 		Profile:         profile.ActiveProfile{Slug: "default"},
 		ApprovalService: approvalService,
+		GoalService:     goals.NewService(app),
 		ToolRegistry: func() *tools.Registry {
 			r := tools.NewRegistry()
 			tools.RegisterCatalogDefaults(r)
@@ -593,6 +602,7 @@ func TestKanbanDashboardDispatchAndCommentFlow(t *testing.T) {
 		Profile:         profile.ActiveProfile{Slug: "default", Root: t.TempDir()},
 		ProviderCatalog: providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", DisplayName: "Model One"}}},
 		SessionService:  sessionService,
+		GoalService:     goals.NewService(app),
 		JobService:      jobs.NewService(app),
 		KanbanService:   kanbanService,
 		QueueManager:    kanban.NewQueueManager(kanbanService, sessionService, orchestrator),

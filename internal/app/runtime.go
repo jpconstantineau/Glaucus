@@ -174,6 +174,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		Profile:       activeProfile,
 		Config:        loadedConfig.Config,
 		Sessions:      runtime.sessions,
+		GoalService:   runtime.goals,
 		PromptBuilder: runtime.prompts,
 		Orchestrator:  runtime.runs,
 		ToolRegistry:  runtime.tools,

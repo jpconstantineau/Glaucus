@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/jpconstantineau/Glaucus/internal/exports"
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	agentruntime "github.com/jpconstantineau/Glaucus/internal/runtime"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
@@ -163,6 +164,8 @@ func (r *Runtime) executePromptRun(ctx context.Context, text, source, actor, sur
 		ProjectContext:  "CLI one-shot prompt execution.",
 		PlatformHint:    "This turn originated from the Glaucus CLI surface.",
 		ProviderOverlay: "Use the configured default CLI provider and model.",
+		SessionGoals:    r.mustListSessionGoals(ctx, session.ID),
+		ProfileGoals:    r.mustListProfileGoals(ctx),
 	})
 	if err != nil {
 		return sessions.Run{}, "", err
@@ -209,4 +212,26 @@ func summarizePromptTitle(text string) string {
 		return text
 	}
 	return strings.TrimSpace(text[:48]) + "..."
+}
+
+func (r *Runtime) mustListSessionGoals(ctx context.Context, sessionID string) []goals.Goal {
+	if r.goals == nil {
+		return nil
+	}
+	sessionGoals, _, err := r.goals.ListActiveGoals(ctx, r.profile.Slug, sessionID)
+	if err != nil {
+		return nil
+	}
+	return sessionGoals
+}
+
+func (r *Runtime) mustListProfileGoals(ctx context.Context) []goals.Goal {
+	if r.goals == nil {
+		return nil
+	}
+	_, profileGoals, err := r.goals.ListActiveGoals(ctx, r.profile.Slug, "")
+	if err != nil {
+		return nil
+	}
+	return profileGoals
 }

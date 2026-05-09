@@ -216,6 +216,32 @@ func (s *Service) ListGoals(ctx context.Context, input ListGoalsInput) ([]Goal, 
 	return items, nil
 }
 
+func (s *Service) ListActiveGoals(ctx context.Context, profileID, sessionID string) ([]Goal, []Goal, error) {
+	profileGoals, err := s.ListGoals(ctx, ListGoalsInput{
+		Scope:     ScopeProfile,
+		ProfileID: profileID,
+		Status:    StatusActive,
+		Limit:     20,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, profileGoals, nil
+	}
+	sessionGoals, err := s.ListGoals(ctx, ListGoalsInput{
+		Scope:     ScopeSession,
+		ProfileID: profileID,
+		SessionID: sessionID,
+		Status:    StatusActive,
+		Limit:     20,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return sessionGoals, profileGoals, nil
+}
+
 func (s *Service) UpdateGoal(ctx context.Context, scope, goalID string, input UpdateGoalInput) (Goal, error) {
 	collection, normalizedScope, err := collectionForScope(scope)
 	if err != nil {
