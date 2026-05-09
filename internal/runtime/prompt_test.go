@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
 )
@@ -46,8 +47,22 @@ func TestPromptBuilderOrdersStagesAndLoadsProfileInputs(t *testing.T) {
 		ToolBehavior:    "Use the safe-default toolset.",
 		ProviderOverlay: "Prefer low-latency models first.",
 		SystemOverride:  "Respond tersely.",
-		ProjectContext:  "Repository root is C:/GIT/Glaucus.",
-		PlatformHint:    "The request originated from the browser UI.",
+		SessionGoals: []goals.Goal{{
+			Title:           "Fix dashboard issue",
+			Statement:       "Keep the active incident contained.",
+			SuccessCriteria: "Bug is reproduced and covered by a test.",
+			Status:          "active",
+			Priority:        "high",
+		}},
+		ProfileGoals: []goals.Goal{{
+			Title:          "Preserve review clarity",
+			Statement:      "Explain changes in a way operators can audit.",
+			Status:         "active",
+			Priority:       "medium",
+			LastEvaluation: map[string]any{"summary": "Previous slice handoff was clean."},
+		}},
+		ProjectContext: "Repository root is C:/GIT/Glaucus.",
+		PlatformHint:   "The request originated from the browser UI.",
 	})
 	if err != nil {
 		t.Fatalf("build prompt: %v", err)
@@ -65,6 +80,7 @@ func TestPromptBuilderOrdersStagesAndLoadsProfileInputs(t *testing.T) {
 		"memory snapshot",
 		"user profile snapshot",
 		"skills index",
+		"goals",
 		"project context",
 		"session metadata",
 		"platform hint",
@@ -79,6 +95,8 @@ func TestPromptBuilderOrdersStagesAndLoadsProfileInputs(t *testing.T) {
 		"Long-term memory",
 		"User profile snapshot",
 		"triage",
+		"Session goals:",
+		"Previous slice handoff was clean.",
 		"Selected Provider: openrouter",
 		"The request originated from the browser UI.",
 	} {

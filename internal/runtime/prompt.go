@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
 )
@@ -27,6 +28,8 @@ type PromptBuildInput struct {
 	SystemOverride  string
 	ProjectContext  string
 	PlatformHint    string
+	SessionGoals    []goals.Goal
+	ProfileGoals    []goals.Goal
 }
 
 type PromptDocument struct {
@@ -49,6 +52,7 @@ func (b *PromptBuilder) Build(input PromptBuildInput) (PromptDocument, error) {
 		b.memorySnapshotStage,
 		b.userProfileStage,
 		b.skillsIndexStage,
+		b.goalsStage,
 		b.projectContextStage,
 		b.sessionMetadataStage,
 		b.platformHintStage,
@@ -182,6 +186,27 @@ func (b *PromptBuilder) projectContextStage(input PromptBuildInput) (PromptFragm
 	return PromptFragment{Name: "project context", Priority: 80, Cacheable: false, Content: content}, true, nil
 }
 
+func (b *PromptBuilder) goalsStage(input PromptBuildInput) (PromptFragment, bool, error) {
+	lines := make([]string, 0, len(input.SessionGoals)+len(input.ProfileGoals)+2)
+	if len(input.SessionGoals) > 0 {
+		lines = append(lines, "Session goals:")
+		lines = append(lines, formatGoalLines(input.SessionGoals)...)
+	}
+	if len(input.ProfileGoals) > 0 {
+		lines = append(lines, "Profile goals:")
+		lines = append(lines, formatGoalLines(input.ProfileGoals)...)
+	}
+	if len(lines) == 0 {
+		return PromptFragment{Name: "goals", Priority: 75, Cacheable: false}, false, nil
+	}
+	return PromptFragment{
+		Name:      "goals",
+		Priority:  75,
+		Cacheable: false,
+		Content:   strings.Join(lines, "\n"),
+	}, true, nil
+}
+
 func (b *PromptBuilder) sessionMetadataStage(input PromptBuildInput) (PromptFragment, bool, error) {
 	if strings.TrimSpace(input.Session.ID) == "" {
 		return PromptFragment{Name: "session metadata", Priority: 90, Cacheable: false}, false, nil
@@ -232,4 +257,23 @@ func readTrimmed(path string) (string, []string, error) {
 		return "", []string{filepath.Base(path) + " empty"}, nil
 	}
 	return content, nil, nil
+}
+
+func formatGoalLines(items []goals.Goal) []string {
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		line := "- [" + item.Status
+		if item.Priority != "" {
+			line += " | " + item.Priority
+		}
+		line += "] " + item.Title + ": " + item.Statement
+		if item.SuccessCriteria != "" {
+			line += " Success criteria: " + item.SuccessCriteria
+		}
+		if summary, ok := item.LastEvaluation["summary"].(string); ok && strings.TrimSpace(summary) != "" {
+			line += " Last evaluation: " + strings.TrimSpace(summary)
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }

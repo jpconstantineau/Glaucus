@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	agentruntime "github.com/jpconstantineau/Glaucus/internal/runtime"
@@ -28,6 +29,7 @@ type RuntimeExecutor struct {
 	Profile       profile.ActiveProfile
 	Config        config.Config
 	Sessions      *sessions.Service
+	GoalService   *goals.Service
 	PromptBuilder *agentruntime.PromptBuilder
 	Orchestrator  *agentruntime.Orchestrator
 	ToolRegistry  *tools.Registry
@@ -82,6 +84,10 @@ func (e RuntimeExecutor) ExecuteJob(ctx context.Context, job Job) (ExecutionResu
 	if err != nil {
 		return ExecutionResult{}, err
 	}
+	sessionGoals, profileGoals, err := loadPromptGoals(ctx, e.GoalService, job.ProfileID, session.ID)
+	if err != nil {
+		return ExecutionResult{}, err
+	}
 
 	promptDoc, err := e.PromptBuilder.Build(agentruntime.PromptBuildInput{
 		Profile:         e.Profile,
@@ -90,6 +96,8 @@ func (e RuntimeExecutor) ExecuteJob(ctx context.Context, job Job) (ExecutionResu
 		ProjectContext:  "Scheduled job working directory: " + fallbackJobCWD(job.CWD, e.Profile.Root),
 		PlatformHint:    "This turn originated from the cron scheduler surface.",
 		ProviderOverlay: "Prefer the job-specific provider override when one is configured.",
+		SessionGoals:    sessionGoals,
+		ProfileGoals:    profileGoals,
 	})
 	if err != nil {
 		return ExecutionResult{}, err
@@ -157,4 +165,11 @@ func fallbackModel(overrides map[string]any, fallback string) string {
 		return strings.TrimSpace(value)
 	}
 	return fallback
+}
+
+func loadPromptGoals(ctx context.Context, service *goals.Service, profileID, sessionID string) ([]goals.Goal, []goals.Goal, error) {
+	if service == nil {
+		return nil, nil, nil
+	}
+	return service.ListActiveGoals(ctx, profileID, sessionID)
 }

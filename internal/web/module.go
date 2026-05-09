@@ -22,6 +22,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/features"
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/kanban"
 	"github.com/jpconstantineau/Glaucus/internal/mcp"
@@ -54,6 +55,7 @@ type Options struct {
 	Profile                 profile.ActiveProfile
 	ProviderCatalog         providers.Catalog
 	SessionService          *sessions.Service
+	GoalService             *goals.Service
 	JobService              *jobs.Service
 	KanbanService           *kanban.Service
 	QueueManager            *kanban.QueueManager
@@ -106,6 +108,7 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/dashboard", m.withOperatorAuth(m.dashboardShell))
 	rg.GET("/dashboard/status", m.withOperatorAuth(m.dashboardStatusPage))
 	rg.GET("/dashboard/sessions", m.withOperatorAuth(m.sessionsPage))
+	rg.GET("/dashboard/goals", m.withOperatorAuth(m.goalsPage))
 	rg.GET("/dashboard/runs/{runID}", m.withOperatorAuth(m.runDetailPage))
 	rg.GET("/dashboard/jobs", m.withOperatorAuth(m.jobsPage))
 	rg.POST("/dashboard/jobs/{jobID}/{action}", m.withOperatorAuth(m.jobActionSubmit))
@@ -126,6 +129,10 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.POST("/dashboard/kanban/tasks/{taskID}/retry", m.withOperatorAuth(m.kanbanTaskRetrySubmit))
 	rg.POST("/dashboard/kanban/tasks/{taskID}/cancel", m.withOperatorAuth(m.kanbanTaskCancelSubmit))
 	rg.POST("/dashboard/kanban/tasks/{taskID}/comments", m.withOperatorAuth(m.kanbanCommentSubmit))
+	rg.POST("/dashboard/goals/{scope}", m.withOperatorAuth(m.goalCreateSubmit))
+	rg.POST("/dashboard/goals/{scope}/{goalID}/save", m.withOperatorAuth(m.goalSaveSubmit))
+	rg.POST("/dashboard/goals/{scope}/{goalID}/evaluate", m.withOperatorAuth(m.goalEvaluateSubmit))
+	rg.POST("/dashboard/goals/{scope}/{goalID}/clear", m.withOperatorAuth(m.goalClearSubmit))
 	rg.GET("/chat", m.withOperatorAuth(m.chatPage))
 	rg.GET("/chat/transcript", m.withOperatorAuth(m.chatTranscript))
 	rg.POST("/chat/send", m.withOperatorAuth(m.chatSend))
@@ -137,6 +144,7 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/api/dashboard/toolsets", m.withOperatorAuth(m.dashboardToolsetsAPI))
 	rg.GET("/api/dashboard/approvals", m.withOperatorAuth(m.dashboardApprovalsAPI))
 	rg.GET("/api/dashboard/sessions", m.withOperatorAuth(m.dashboardSessionsAPI))
+	rg.GET("/api/dashboard/goals", m.withOperatorAuth(m.dashboardGoalsAPI))
 	rg.GET("/api/dashboard/jobs", m.withOperatorAuth(m.dashboardJobsAPI))
 	rg.GET("/api/dashboard/adapters", m.withOperatorAuth(m.dashboardAdaptersAPI))
 	rg.GET("/api/dashboard/secrets", m.withOperatorAuth(m.dashboardSecretsAPI))
@@ -329,6 +337,8 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 
 	var activeSession *sessions.Session
 	var transcript []sessions.Message
+	var sessionGoals []goals.Goal
+	var profileGoals []goals.Goal
 	if activeSessionID != "" {
 		session, err := m.options.SessionService.GetSession(e.Request.Context(), activeSessionID)
 		if err != nil {
@@ -339,6 +349,15 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 		transcript, err = m.options.SessionService.ListMessages(e.Request.Context(), activeSessionID)
 		if err != nil {
 			return e.InternalServerError("failed to load transcript", err)
+		}
+		sessionGoals, profileGoals, err = m.promptGoals(e.Request.Context(), activeSessionID)
+		if err != nil {
+			return e.InternalServerError("failed to load goals", err)
+		}
+	} else if m.options.GoalService != nil {
+		_, profileGoals, err = m.options.GoalService.ListActiveGoals(e.Request.Context(), profileID, "")
+		if err != nil {
+			return e.InternalServerError("failed to load profile goals", err)
 		}
 	}
 
@@ -358,6 +377,8 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 		ActiveRunID:     runID,
 		StreamURL:       "/api/dashboard/runs/" + url.PathEscape(runID) + "/stream",
 		TranscriptURL:   "/chat/transcript?session=" + url.QueryEscape(activeSessionID),
+		SessionGoals:    sessionGoals,
+		ProfileGoals:    profileGoals,
 	}
 
 	return e.HTML(http.StatusOK, chatTemplate(data))
@@ -448,6 +469,10 @@ func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 
 	promptDoc := runtime.PromptDocument{}
 	if invocation == nil {
+		sessionGoals, profileGoals, goalErr := m.promptGoals(e.Request.Context(), session.ID)
+		if goalErr != nil {
+			return e.InternalServerError("failed to load goals", goalErr)
+		}
 		promptDoc, err = m.options.PromptBuilder.Build(runtime.PromptBuildInput{
 			Profile:         m.options.Profile,
 			Session:         session,
@@ -455,6 +480,8 @@ func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 			ProjectContext:  "Current profile root: " + m.options.Profile.Root,
 			PlatformHint:    "This turn originated from the browser chat surface.",
 			ProviderOverlay: "Prefer the selected provider/model unless a deterministic fallback is required.",
+			SessionGoals:    sessionGoals,
+			ProfileGoals:    profileGoals,
 		})
 		if err != nil {
 			return e.InternalServerError("failed to build prompt", err)
@@ -548,6 +575,36 @@ func (m *Module) sessionsPage(e *core.RequestEvent, _ *core.Record) error {
 		Query:   query,
 		List:    sessionList,
 		Search:  searchResults,
+	}))
+}
+
+func (m *Module) goalsPage(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.SessionService == nil || m.options.GoalService == nil {
+		return e.InternalServerError("goal dashboard unavailable", nil)
+	}
+	csrfToken, err := ensureCSRFCookie(e)
+	if err != nil {
+		return e.InternalServerError("failed to create goal form", err)
+	}
+	sessionList, err := m.options.SessionService.ListSessions(e.Request.Context(), m.options.Profile.Slug, 50)
+	if err != nil {
+		return e.InternalServerError("failed to list sessions", err)
+	}
+	selectedSessionID := strings.TrimSpace(e.Request.URL.Query().Get("session"))
+	if selectedSessionID == "" && len(sessionList) > 0 {
+		selectedSessionID = sessionList[0].ID
+	}
+	sessionGoals, profileGoals, err := m.promptGoals(e.Request.Context(), selectedSessionID)
+	if err != nil {
+		return e.InternalServerError("failed to load goals", err)
+	}
+	return e.HTML(http.StatusOK, goalsTemplate(goalsPageData{
+		AppName:           m.options.AppName,
+		CSRF:              csrfToken,
+		Sessions:          sessionList,
+		SelectedSessionID: selectedSessionID,
+		SessionGoals:      sessionGoals,
+		ProfileGoals:      profileGoals,
 	}))
 }
 
@@ -1195,6 +1252,23 @@ func (m *Module) dashboardSessionsAPI(e *core.RequestEvent, _ *core.Record) erro
 	return e.JSON(http.StatusOK, map[string]any{"data": items})
 }
 
+func (m *Module) dashboardGoalsAPI(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.GoalService == nil {
+		return e.JSON(http.StatusOK, map[string]any{"data": []any{}})
+	}
+	items, err := m.options.GoalService.ListGoals(e.Request.Context(), goals.ListGoalsInput{
+		Scope:     e.Request.URL.Query().Get("scope"),
+		ProfileID: m.options.Profile.Slug,
+		SessionID: e.Request.URL.Query().Get("session_id"),
+		Status:    e.Request.URL.Query().Get("status"),
+		Limit:     50,
+	})
+	if err != nil {
+		return e.InternalServerError("failed to list goals", err)
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": items})
+}
+
 func (m *Module) dashboardJobsAPI(e *core.RequestEvent, _ *core.Record) error {
 	if m.options.JobService == nil {
 		return e.JSON(http.StatusOK, map[string]any{"data": []any{}})
@@ -1433,6 +1507,94 @@ func (m *Module) processChatRun(run sessions.Run, input runtime.ExecuteRunInput)
 	})
 }
 
+func (m *Module) goalCreateSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.GoalService == nil {
+		return e.InternalServerError("goal service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	scope := e.Request.PathValue("scope")
+	sessionID := strings.TrimSpace(e.Request.FormValue("session_id"))
+	_, err := m.options.GoalService.CreateGoal(e.Request.Context(), goals.CreateGoalInput{
+		Scope:           scope,
+		ProfileID:       m.options.Profile.Slug,
+		SessionID:       sessionID,
+		Title:           strings.TrimSpace(e.Request.FormValue("title")),
+		Statement:       strings.TrimSpace(e.Request.FormValue("statement")),
+		SuccessCriteria: strings.TrimSpace(e.Request.FormValue("success_criteria")),
+		Priority:        fallbackString(strings.TrimSpace(e.Request.FormValue("priority")), "medium"),
+		Status:          fallbackString(strings.TrimSpace(e.Request.FormValue("status")), goals.StatusActive),
+	})
+	if err != nil {
+		return e.BadRequestError(err.Error(), err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/goals?session="+url.QueryEscape(sessionID))
+}
+
+func (m *Module) goalSaveSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.GoalService == nil {
+		return e.InternalServerError("goal service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	scope := e.Request.PathValue("scope")
+	goalID := e.Request.PathValue("goalID")
+	sessionID := strings.TrimSpace(e.Request.FormValue("session_id"))
+	_, err := m.options.GoalService.UpdateGoal(e.Request.Context(), scope, goalID, goals.UpdateGoalInput{
+		Title:           strings.TrimSpace(e.Request.FormValue("title")),
+		Statement:       strings.TrimSpace(e.Request.FormValue("statement")),
+		SuccessCriteria: strings.TrimSpace(e.Request.FormValue("success_criteria")),
+		Status:          strings.TrimSpace(e.Request.FormValue("status")),
+		Priority:        strings.TrimSpace(e.Request.FormValue("priority")),
+	})
+	if err != nil {
+		return e.BadRequestError(err.Error(), err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/goals?session="+url.QueryEscape(sessionID))
+}
+
+func (m *Module) goalEvaluateSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.GoalService == nil {
+		return e.InternalServerError("goal service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	scope := e.Request.PathValue("scope")
+	goalID := e.Request.PathValue("goalID")
+	sessionID := strings.TrimSpace(e.Request.FormValue("session_id"))
+	_, err := m.options.GoalService.EvaluateGoal(e.Request.Context(), scope, goalID, goals.EvaluateGoalInput{
+		Status: strings.TrimSpace(e.Request.FormValue("status")),
+		Evaluation: map[string]any{
+			"outcome": strings.TrimSpace(e.Request.FormValue("outcome")),
+			"summary": strings.TrimSpace(e.Request.FormValue("summary")),
+		},
+	})
+	if err != nil {
+		return e.BadRequestError(err.Error(), err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/goals?session="+url.QueryEscape(sessionID))
+}
+
+func (m *Module) goalClearSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.GoalService == nil {
+		return e.InternalServerError("goal service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	scope := e.Request.PathValue("scope")
+	goalID := e.Request.PathValue("goalID")
+	sessionID := strings.TrimSpace(e.Request.FormValue("session_id"))
+	_, err := m.options.GoalService.ClearGoal(e.Request.Context(), scope, goalID, goals.ClearGoalInput{})
+	if err != nil {
+		return e.BadRequestError(err.Error(), err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/goals?session="+url.QueryEscape(sessionID))
+}
+
 func (m *Module) withOperatorAuth(next func(*core.RequestEvent, *core.Record) error) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		if err := m.requireLocalHost(e); err != nil {
@@ -1554,6 +1716,8 @@ type chatPageData struct {
 	Sessions        []sessions.Session
 	ActiveSession   *sessions.Session
 	Transcript      []sessions.Message
+	SessionGoals    []goals.Goal
+	ProfileGoals    []goals.Goal
 	Models          []modelOption
 	Toolsets        []string
 	SelectedModel   string
@@ -1662,7 +1826,7 @@ var dashboardPageTmpl = template.Must(template.New("dashboard").Parse(`<!doctype
       <h2>Operator Console</h2>
       <p>Open the operator status page at <a href="/dashboard/status">/dashboard/status</a>, the browser chat at <a href="/chat">/chat</a>, and the sessions explorer at <a href="/dashboard/sessions">/dashboard/sessions</a>.</p>
       <p>Inspect run detail from <a href="/dashboard/runs/">/dashboard/runs/&lt;runID&gt;</a>, cron jobs at <a href="/dashboard/jobs">/dashboard/jobs</a>, messaging adapters at <a href="/dashboard/adapters">/dashboard/adapters</a>, skills at <a href="/dashboard/skills">/dashboard/skills</a>, and logs at <a href="/dashboard/logs">/dashboard/logs</a>.</p>
-      <p>Review approval requests at <a href="/dashboard/approvals">/dashboard/approvals</a>, inspect effective tool availability at <a href="/dashboard/tools">/dashboard/tools</a>, and manage delegated work from <a href="/dashboard/kanban">/dashboard/kanban</a>.</p>
+      <p>Review approval requests at <a href="/dashboard/approvals">/dashboard/approvals</a>, inspect effective tool availability at <a href="/dashboard/tools">/dashboard/tools</a>, manage delegated work from <a href="/dashboard/kanban">/dashboard/kanban</a>, and adjust persistent goals at <a href="/dashboard/goals">/dashboard/goals</a>.</p>
       <p>Machine-readable endpoints: <a href="/health">/health</a>, <a href="/health/detailed">/health/detailed</a>, <a href="/api/version">/api/version</a>.</p>
     </section>
   </main>
@@ -1754,6 +1918,25 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
           {{end}}
         {{else}}
           <div class="empty">Your first browser prompt will create the first session.</div>
+        {{end}}
+      </div>
+      <div class="session-list">
+        <strong>Goal Context</strong>
+        {{range .SessionGoals}}
+          <div class="session-item">
+            <div class="session-title">{{.Title}}</div>
+            <div class="session-meta">Session goal · {{.Status}} · {{.Priority}}</div>
+          </div>
+        {{end}}
+        {{range .ProfileGoals}}
+          <div class="session-item">
+            <div class="session-title">{{.Title}}</div>
+            <div class="session-meta">Profile goal · {{.Status}} · {{.Priority}}</div>
+          </div>
+        {{else}}
+          {{if not .SessionGoals}}
+            <div class="empty">No active goals yet.</div>
+          {{end}}
         {{end}}
       </div>
     </aside>
@@ -1887,6 +2070,12 @@ func transcriptTemplate(messages []sessions.Message) string {
 	return sb.String()
 }
 
+func goalsTemplate(data goalsPageData) string {
+	var sb strings.Builder
+	_ = goalsPageTmpl.Execute(&sb, data)
+	return sb.String()
+}
+
 func (m *Module) modelOptions() []modelOption {
 	options := make([]modelOption, 0, len(m.options.ProviderCatalog.Entries))
 	for _, entry := range m.options.ProviderCatalog.Entries {
@@ -1994,6 +2183,15 @@ type kanbanPageData struct {
 	SelectedToolset string
 	StatusOptions   []string
 	PriorityOptions []string
+}
+
+type goalsPageData struct {
+	AppName           string
+	CSRF              string
+	Sessions          []sessions.Session
+	SelectedSessionID string
+	SessionGoals      []goals.Goal
+	ProfileGoals      []goals.Goal
 }
 
 type kanbanBoardView struct {
@@ -2422,7 +2620,7 @@ var sessionsPageTmpl = template.Must(template.New("sessions").Parse(`<!doctype h
       <article class="item">
         <strong>{{.Title}}</strong>
         <div>Status: {{.Status}} · Source: {{.Source}}</div>
-        <div><a href="/chat?session={{.ID}}">Open chat</a></div>
+        <div><a href="/chat?session={{.ID}}">Open chat</a> · <a href="/dashboard/goals?session={{.ID}}">View goals</a></div>
       </article>
     {{else}}
       <p>No sessions yet.</p>
@@ -2437,6 +2635,182 @@ var sessionsPageTmpl = template.Must(template.New("sessions").Parse(`<!doctype h
     {{else}}
       <p>No search results.</p>
     {{end}}
+  </section>
+</body>
+</html>`))
+
+var goalsPageTmpl = template.Must(template.New("goals").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Goals</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 78rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); }
+    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .9rem; margin-top: .85rem; }
+    .meta { color: #52606d; font-size: .95rem; }
+    form { display: grid; gap: .6rem; margin-top: .6rem; }
+    input, textarea, select, button { font: inherit; }
+    input, textarea, select { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; box-sizing: border-box; }
+    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
+    .subtle { background: #486581; }
+    .danger { background: #b42318; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Persistent Goals</h1>
+    <p><a href="/dashboard">Back to dashboard</a> · {{if .SelectedSessionID}}<a href="/chat?session={{.SelectedSessionID}}">Open session chat</a>{{end}}</p>
+    <div class="grid">
+      <form method="get" action="/dashboard/goals">
+        <h2>Session Focus</h2>
+        <select name="session">
+          <option value="">Profile-only view</option>
+          {{range .Sessions}}
+            <option value="{{.ID}}" {{if eq $.SelectedSessionID .ID}}selected{{end}}>{{.Title}}</option>
+          {{end}}
+        </select>
+        <button type="submit" class="subtle">Load Goals</button>
+      </form>
+      <form method="post" action="/dashboard/goals/profile">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <h2>Create Profile Goal</h2>
+        <input type="text" name="title" placeholder="Goal title" required>
+        <textarea name="statement" rows="3" placeholder="What should remain true?" required></textarea>
+        <textarea name="success_criteria" rows="2" placeholder="How do we know it is done?"></textarea>
+        <select name="priority">
+          <option value="high">high</option>
+          <option value="medium" selected>medium</option>
+          <option value="low">low</option>
+        </select>
+        <button type="submit">Create Profile Goal</button>
+      </form>
+      <form method="post" action="/dashboard/goals/session">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <h2>Create Session Goal</h2>
+        <select name="session_id" required>
+          <option value="">Select session</option>
+          {{range .Sessions}}
+            <option value="{{.ID}}" {{if eq $.SelectedSessionID .ID}}selected{{end}}>{{.Title}}</option>
+          {{end}}
+        </select>
+        <input type="text" name="title" placeholder="Goal title" required>
+        <textarea name="statement" rows="3" placeholder="What should this session accomplish?" required></textarea>
+        <textarea name="success_criteria" rows="2" placeholder="Definition of done"></textarea>
+        <select name="priority">
+          <option value="high">high</option>
+          <option value="medium" selected>medium</option>
+          <option value="low">low</option>
+        </select>
+        <button type="submit">Create Session Goal</button>
+      </form>
+    </div>
+    <div class="grid">
+      <section>
+        <h2>Profile Goals</h2>
+        {{range .ProfileGoals}}
+          <article class="item">
+            <strong>{{.Title}}</strong>
+            <div class="meta">{{.Status}} · {{.Priority}}</div>
+            <p>{{.Statement}}</p>
+            <form method="post" action="/dashboard/goals/profile/{{.ID}}/save">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="session_id" value="{{$.SelectedSessionID}}">
+              <input type="text" name="title" value="{{.Title}}">
+              <textarea name="statement" rows="3">{{.Statement}}</textarea>
+              <textarea name="success_criteria" rows="2">{{.SuccessCriteria}}</textarea>
+              <div class="grid">
+                <select name="status">
+                  <option value="active" {{if eq .Status "active"}}selected{{end}}>active</option>
+                  <option value="in_review" {{if eq .Status "in_review"}}selected{{end}}>in_review</option>
+                  <option value="satisfied" {{if eq .Status "satisfied"}}selected{{end}}>satisfied</option>
+                  <option value="blocked" {{if eq .Status "blocked"}}selected{{end}}>blocked</option>
+                </select>
+                <select name="priority">
+                  <option value="high" {{if eq .Priority "high"}}selected{{end}}>high</option>
+                  <option value="medium" {{if eq .Priority "medium"}}selected{{end}}>medium</option>
+                  <option value="low" {{if eq .Priority "low"}}selected{{end}}>low</option>
+                </select>
+              </div>
+              <button type="submit" class="subtle">Save Goal</button>
+            </form>
+            <form method="post" action="/dashboard/goals/profile/{{.ID}}/evaluate">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="session_id" value="{{$.SelectedSessionID}}">
+              <input type="text" name="outcome" placeholder="Outcome (met, partial, blocked)">
+              <textarea name="summary" rows="2" placeholder="Evaluation summary"></textarea>
+              <select name="status">
+                <option value="active">active</option>
+                <option value="in_review">in_review</option>
+                <option value="satisfied">satisfied</option>
+                <option value="blocked">blocked</option>
+              </select>
+              <button type="submit">Record Evaluation</button>
+            </form>
+            <form method="post" action="/dashboard/goals/profile/{{.ID}}/clear">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="session_id" value="{{$.SelectedSessionID}}">
+              <button type="submit" class="danger">Clear Goal</button>
+            </form>
+          </article>
+        {{else}}
+          <p>No active profile goals.</p>
+        {{end}}
+      </section>
+      <section>
+        <h2>Session Goals</h2>
+        {{range .SessionGoals}}
+          <article class="item">
+            <strong>{{.Title}}</strong>
+            <div class="meta">{{.Status}} · {{.Priority}}</div>
+            <p>{{.Statement}}</p>
+            <form method="post" action="/dashboard/goals/session/{{.ID}}/save">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="session_id" value="{{$.SelectedSessionID}}">
+              <input type="text" name="title" value="{{.Title}}">
+              <textarea name="statement" rows="3">{{.Statement}}</textarea>
+              <textarea name="success_criteria" rows="2">{{.SuccessCriteria}}</textarea>
+              <div class="grid">
+                <select name="status">
+                  <option value="active" {{if eq .Status "active"}}selected{{end}}>active</option>
+                  <option value="in_review" {{if eq .Status "in_review"}}selected{{end}}>in_review</option>
+                  <option value="satisfied" {{if eq .Status "satisfied"}}selected{{end}}>satisfied</option>
+                  <option value="blocked" {{if eq .Status "blocked"}}selected{{end}}>blocked</option>
+                </select>
+                <select name="priority">
+                  <option value="high" {{if eq .Priority "high"}}selected{{end}}>high</option>
+                  <option value="medium" {{if eq .Priority "medium"}}selected{{end}}>medium</option>
+                  <option value="low" {{if eq .Priority "low"}}selected{{end}}>low</option>
+                </select>
+              </div>
+              <button type="submit" class="subtle">Save Goal</button>
+            </form>
+            <form method="post" action="/dashboard/goals/session/{{.ID}}/evaluate">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="session_id" value="{{$.SelectedSessionID}}">
+              <input type="text" name="outcome" placeholder="Outcome (met, partial, blocked)">
+              <textarea name="summary" rows="2" placeholder="Evaluation summary"></textarea>
+              <select name="status">
+                <option value="active">active</option>
+                <option value="in_review">in_review</option>
+                <option value="satisfied">satisfied</option>
+                <option value="blocked">blocked</option>
+              </select>
+              <button type="submit">Record Evaluation</button>
+            </form>
+            <form method="post" action="/dashboard/goals/session/{{.ID}}/clear">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="session_id" value="{{$.SelectedSessionID}}">
+              <button type="submit" class="danger">Clear Goal</button>
+            </form>
+          </article>
+        {{else}}
+          <p>{{if .SelectedSessionID}}No active session goals.{{else}}Select a session to inspect session-scoped goals.{{end}}</p>
+        {{end}}
+      </section>
+    </div>
   </section>
 </body>
 </html>`))
@@ -2699,4 +3073,11 @@ func firstValue(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func (m *Module) promptGoals(ctx context.Context, sessionID string) ([]goals.Goal, []goals.Goal, error) {
+	if m.options.GoalService == nil {
+		return nil, nil, nil
+	}
+	return m.options.GoalService.ListActiveGoals(ctx, m.options.Profile.Slug, sessionID)
 }
