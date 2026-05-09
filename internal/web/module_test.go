@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -526,6 +527,58 @@ func TestLoginFailureRendersLoginPageError(t *testing.T) {
 	}
 	if strings.Contains(body, `{"data":`) {
 		t.Fatalf("expected login page html instead of json error, got %s", body)
+	}
+}
+
+func TestBuildChatMessagesIncludesConversationHistory(t *testing.T) {
+	messages := buildChatMessages([]sessions.Message{
+		{Role: "user", VisibleText: "First question"},
+		{Role: "assistant", VisibleText: "First answer"},
+		{Role: "system", VisibleText: "ignored"},
+		{Role: "user", VisibleText: "Follow-up"},
+	})
+	if len(messages) != 3 {
+		t.Fatalf("expected three chat messages, got %#v", messages)
+	}
+	if messages[0].Content != "First question" || messages[1].Content != "First answer" || messages[2].Content != "Follow-up" {
+		t.Fatalf("unexpected chat history mapping: %#v", messages)
+	}
+}
+
+func TestRenderMarkdownFormatsAssistantTranscript(t *testing.T) {
+	html := string(renderMarkdown("## Title\n\n- one\n- two\n\n**bold**"))
+	if !strings.Contains(html, "<h2>Title</h2>") || !strings.Contains(html, "<strong>bold</strong>") || !strings.Contains(html, "<li>one</li>") {
+		t.Fatalf("expected markdown html output, got %s", html)
+	}
+}
+
+func TestModelOptionsHideUnreachableSelfHostedProvider(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Fatalf("unexpected probe path %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	module := &Module{options: Options{
+		ProviderCatalog: providers.Catalog{Entries: []providers.CatalogEntry{
+			{ProviderID: "selfhosted-openai", ModelID: "offline", DisplayName: "Offline", BaseURL: "http://127.0.0.1:0", ProviderCategory: "text_generation"},
+			{ProviderID: "selfhosted-openai", ModelID: "healthy", DisplayName: "Healthy", BaseURL: server.URL, ProviderCategory: "text_generation"},
+			{ProviderID: "ollama-local", ModelID: "llama3.2:3b", DisplayName: "Local", BaseURL: "http://127.0.0.1:11434/v1", ProviderCategory: "text_generation"},
+		}},
+	}}
+
+	options := module.modelOptions()
+	refs := make([]string, 0, len(options))
+	for _, option := range options {
+		refs = append(refs, option.Ref)
+	}
+	if slices.Contains(refs, "selfhosted-openai/offline") {
+		t.Fatalf("expected unreachable self-hosted provider to be hidden, got %#v", refs)
+	}
+	if !slices.Contains(refs, "selfhosted-openai/healthy") {
+		t.Fatalf("expected reachable self-hosted provider to remain selectable, got %#v", refs)
 	}
 }
 

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"embed"
@@ -40,6 +41,9 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/tools"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
+	goldhtml "github.com/yuin/goldmark/renderer/html"
 )
 
 const (
@@ -49,6 +53,11 @@ const (
 
 //go:embed static/*
 var staticAssets embed.FS
+
+var markdownRenderer = goldmark.New(
+	goldmark.WithExtensions(extension.GFM),
+	goldmark.WithRendererOptions(goldhtml.WithHardWraps(), goldhtml.WithXHTML()),
+)
 
 type Options struct {
 	AppName                 string
@@ -154,6 +163,9 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/chat", m.withOperatorAuth(m.chatPage))
 	rg.GET("/chat/transcript", m.withOperatorAuth(m.chatTranscript))
 	rg.POST("/chat/send", m.withOperatorAuth(m.chatSend))
+	rg.POST("/chat/sessions/new", m.withOperatorAuth(m.chatSessionNew))
+	rg.POST("/chat/sessions/{sessionID}/archive", m.withOperatorAuth(m.chatSessionArchive))
+	rg.POST("/chat/sessions/{sessionID}/delete", m.withOperatorAuth(m.chatSessionDelete))
 	rg.GET("/health/detailed", m.withOperatorAuth(m.detailedHealth))
 	rg.GET("/api/version", m.withOperatorAuth(m.versionInfo))
 	rg.GET("/api/dashboard/status", m.withOperatorAuth(m.dashboardStatusAPI))
@@ -387,9 +399,10 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 		return e.InternalServerError("failed to list sessions", err)
 	}
 
+	newSessionRequested := e.Request.URL.Query().Get("new") == "1"
 	activeSessionID := strings.TrimSpace(e.Request.URL.Query().Get("session"))
-	if activeSessionID == "" && len(sessionList) > 0 {
-		activeSessionID = sessionList[0].ID
+	if activeSessionID == "" && !newSessionRequested {
+		activeSessionID = defaultSessionID(sessionList)
 	}
 
 	var activeSession *sessions.Session
@@ -419,7 +432,8 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 	}
 
 	runID := strings.TrimSpace(e.Request.URL.Query().Get("run"))
-	selectedToolset := fallbackString(e.Request.URL.Query().Get("toolset"), m.defaultToolset())
+	selectedModel := selectedModelRef(e.Request.URL.Query().Get("model"), activeSession, m.options.LoadedConfig)
+	selectedToolset := selectedToolsetName(e.Request.URL.Query().Get("toolset"), activeSession, m.defaultToolset())
 	data := chatPageData{
 		AppName:         m.options.AppName,
 		OperatorEmail:   operator.Email(),
@@ -428,7 +442,7 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 		ActiveSession:   activeSession,
 		Transcript:      transcript,
 		Models:          m.modelOptions(),
-		SelectedModel:   defaultModelRef(m.options.LoadedConfig),
+		SelectedModel:   selectedModel,
 		Toolsets:        m.toolsetOptions(),
 		SelectedToolset: selectedToolset,
 		ActiveRunID:     runID,
@@ -511,6 +525,22 @@ func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 		if err != nil {
 			return e.InternalServerError("failed to load session", err)
 		}
+		session, err = m.options.SessionService.UpdateSession(e.Request.Context(), session.ID, sessions.UpdateSessionInput{
+			Status: "active",
+			ModelSnapshot: map[string]any{
+				"provider": providerID,
+				"model":    modelID,
+			},
+			ToolsetSnapshot: map[string]any{
+				"name":         fallbackString(toolsetRef, m.defaultToolset()),
+				"surface":      tools.SurfaceWebChat,
+				"tool_names":   toolResolution.ToolNames,
+				"availability": toolResolution.Availability,
+			},
+		})
+		if err != nil {
+			return e.InternalServerError("failed to update session", err)
+		}
 	}
 
 	userMessage, err := m.options.SessionService.CreateMessage(e.Request.Context(), sessions.CreateMessageInput{
@@ -522,6 +552,10 @@ func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 	})
 	if err != nil {
 		return e.InternalServerError("failed to persist user message", err)
+	}
+	messages, err := m.options.SessionService.ListMessages(e.Request.Context(), session.ID)
+	if err != nil {
+		return e.InternalServerError("failed to load session history", err)
 	}
 
 	promptDoc := runtime.PromptDocument{}
@@ -557,7 +591,7 @@ func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 		ToolInvocation: invocation,
 		Prompt:         promptDoc,
 		Request: providers.NormalizedRequest{
-			Messages:     []providers.RequestMessage{{Role: "user", Content: promptText}},
+			Messages:     buildChatMessages(messages),
 			RequiredCaps: []string{"chat"},
 		},
 		Resolution: providers.ResolutionInput{
@@ -575,6 +609,45 @@ func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 	go m.processChatRun(run, input)
 
 	return e.Redirect(http.StatusSeeOther, "/chat?session="+url.QueryEscape(session.ID)+"&run="+url.QueryEscape(run.ID))
+}
+
+func (m *Module) chatSessionNew(e *core.RequestEvent, _ *core.Record) error {
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	query := url.Values{}
+	query.Set("new", "1")
+	query.Set("model", strings.TrimSpace(e.Request.FormValue("model")))
+	query.Set("toolset", strings.TrimSpace(e.Request.FormValue("toolset")))
+	return e.Redirect(http.StatusSeeOther, "/chat?"+query.Encode())
+}
+
+func (m *Module) chatSessionArchive(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.SessionService == nil {
+		return e.InternalServerError("session service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	sessionID := e.Request.PathValue("sessionID")
+	if _, err := m.options.SessionService.UpdateSession(e.Request.Context(), sessionID, sessions.UpdateSessionInput{Status: "archived"}); err != nil {
+		return e.InternalServerError("failed to archive session", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/chat?new=1")
+}
+
+func (m *Module) chatSessionDelete(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.SessionService == nil {
+		return e.InternalServerError("session service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	sessionID := e.Request.PathValue("sessionID")
+	if err := m.options.SessionService.DeleteSession(e.Request.Context(), sessionID); err != nil {
+		return e.InternalServerError("failed to delete session", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/chat?new=1")
 }
 
 func (m *Module) dashboardStatusPage(e *core.RequestEvent, operator *core.Record) error {
@@ -1984,7 +2057,9 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!doctype html>
 </body>
 </html>`))
 
-var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
+var chatPageTmpl = template.Must(template.New("chat").Funcs(template.FuncMap{
+	"renderMarkdown": renderMarkdown,
+}).Parse(`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -2003,14 +2078,34 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
   </header>
   <main>
     <aside class="panel sessions">
-      <strong>Sessions</strong>
+      <div class="session-toolbar">
+        <strong>Sessions</strong>
+        <form method="post" action="/chat/sessions/new">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <input type="hidden" name="model" value="{{.SelectedModel}}">
+          <input type="hidden" name="toolset" value="{{.SelectedToolset}}">
+          <button type="submit" class="subtle">New Session</button>
+        </form>
+      </div>
       <div class="session-list">
         {{if .Sessions}}
           {{range .Sessions}}
-            <a class="session-item{{if $.ActiveSession}}{{if eq $.ActiveSession.ID .ID}} active{{end}}{{end}}" href="/chat?session={{.ID}}">
-              <div class="session-title">{{.Title}}</div>
-              <div class="session-meta">{{.Status}} · {{.Source}}</div>
-            </a>
+            <article class="session-item{{if $.ActiveSession}}{{if eq $.ActiveSession.ID .ID}} active{{end}}{{end}}">
+              <a class="session-link" href="/chat?session={{.ID}}">
+                <div class="session-title">{{.Title}}</div>
+                <div class="session-meta">{{.Status}} | {{.Source}}</div>
+              </a>
+              <div class="session-actions">
+                <form method="post" action="/chat/sessions/{{.ID}}/archive">
+                  <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                  <button type="submit" class="subtle">Archive</button>
+                </form>
+                <form method="post" action="/chat/sessions/{{.ID}}/delete" onsubmit="return confirm('Delete this session and its runs?');">
+                  <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                  <button type="submit" class="danger">Delete</button>
+                </form>
+              </div>
+            </article>
           {{end}}
         {{else}}
           <div class="empty">Your first browser prompt will create the first session.</div>
@@ -2021,13 +2116,13 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         {{range .SessionGoals}}
           <div class="session-item">
             <div class="session-title">{{.Title}}</div>
-            <div class="session-meta">Session goal · {{.Status}} · {{.Priority}}</div>
+            <div class="session-meta">Session goal | {{.Status}} | {{.Priority}}</div>
           </div>
         {{end}}
         {{range .ProfileGoals}}
           <div class="session-item">
             <div class="session-title">{{.Title}}</div>
-            <div class="session-meta">Profile goal · {{.Status}} · {{.Priority}}</div>
+            <div class="session-meta">Profile goal | {{.Status}} | {{.Priority}}</div>
           </div>
         {{else}}
           {{if not .SessionGoals}}
@@ -2060,10 +2155,10 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
             </select>
           </label>
         </div>
-        <label style="display:block; margin-top:1rem;">Prompt
+        <label class="prompt-field">Prompt
           <textarea name="prompt" placeholder="Ask Glaucus to summarize a file, inspect the repo, or answer a question..." required></textarea>
         </label>
-        <div style="margin-top:1rem;">
+        <div class="form-actions">
           <button type="submit">Send Prompt</button>
         </div>
       </form>
@@ -2108,6 +2203,9 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         if (payload.payload && payload.payload.text && !live.textContent) {
           live.textContent = payload.payload.text;
         }
+        fetch({{printf "%q" .TranscriptURL}}, { credentials: "same-origin" })
+          .then(function (response) { return response.text(); })
+          .then(function (html) { transcript.innerHTML = html; });
       });
       ["run.completed", "run.failed", "run.cancelled"].forEach(function (name) {
         source.addEventListener(name, function () {
@@ -2127,7 +2225,11 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
       {{range .}}
         <article class="message {{.Role}}">
           <div class="role">{{.Role}}</div>
-          <div>{{.VisibleText}}</div>
+          {{if eq .Role "assistant"}}
+            <div class="markdown">{{renderMarkdown .VisibleText}}</div>
+          {{else}}
+            <div>{{.VisibleText}}</div>
+          {{end}}
         </article>
       {{end}}
     </div>
@@ -2173,11 +2275,21 @@ func goalsTemplate(data goalsPageData) string {
 }
 
 func (m *Module) modelOptions() []modelOption {
-	options := make([]modelOption, 0, len(m.options.ProviderCatalog.Entries))
+	filtered := make([]providers.CatalogEntry, 0, len(m.options.ProviderCatalog.Entries))
 	for _, entry := range m.options.ProviderCatalog.Entries {
+		if m.providerSelectable(entry) {
+			filtered = append(filtered, entry)
+		}
+	}
+	entries := filtered
+	if len(entries) == 0 {
+		entries = m.options.ProviderCatalog.Entries
+	}
+	options := make([]modelOption, 0, len(entries))
+	for _, entry := range entries {
 		options = append(options, modelOption{
 			Ref:   entry.ProviderID + "/" + entry.ModelID,
-			Label: entry.DisplayName + " · " + entry.ProviderID,
+			Label: entry.DisplayName + " | " + entry.ProviderID,
 		})
 	}
 	sort.SliceStable(options, func(i, j int) bool {
@@ -2240,6 +2352,102 @@ func defaultModelRef(cfg config.Config) string {
 		return ""
 	}
 	return cfg.Model.DefaultProvider + "/" + cfg.Model.DefaultModel
+}
+
+func selectedModelRef(queryValue string, session *sessions.Session, cfg config.Config) string {
+	if trimmed := strings.TrimSpace(queryValue); trimmed != "" {
+		return trimmed
+	}
+	if session != nil {
+		if provider, ok := session.ModelSnapshot["provider"].(string); ok && strings.TrimSpace(provider) != "" {
+			if model, ok := session.ModelSnapshot["model"].(string); ok && strings.TrimSpace(model) != "" {
+				return provider + "/" + model
+			}
+		}
+	}
+	return defaultModelRef(cfg)
+}
+
+func selectedToolsetName(queryValue string, session *sessions.Session, fallback string) string {
+	if trimmed := strings.TrimSpace(queryValue); trimmed != "" {
+		return trimmed
+	}
+	if session != nil {
+		if name, ok := session.ToolsetSnapshot["name"].(string); ok && strings.TrimSpace(name) != "" {
+			return name
+		}
+	}
+	return fallback
+}
+
+func defaultSessionID(items []sessions.Session) string {
+	for _, item := range items {
+		if item.Status != "archived" {
+			return item.ID
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	return items[0].ID
+}
+
+func buildChatMessages(items []sessions.Message) []providers.RequestMessage {
+	messages := make([]providers.RequestMessage, 0, len(items))
+	for _, item := range items {
+		if item.Role != "user" && item.Role != "assistant" {
+			continue
+		}
+		text := strings.TrimSpace(item.VisibleText)
+		if text == "" {
+			continue
+		}
+		messages = append(messages, providers.RequestMessage{
+			Role:    item.Role,
+			Content: text,
+		})
+	}
+	return messages
+}
+
+func renderMarkdown(text string) template.HTML {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	var output bytes.Buffer
+	if err := markdownRenderer.Convert([]byte(text), &output); err != nil {
+		return template.HTML("<p>" + template.HTMLEscapeString(text) + "</p>")
+	}
+	return template.HTML(output.String())
+}
+
+func (m *Module) providerSelectable(entry providers.CatalogEntry) bool {
+	if m.providerAvailabilityReason(entry) != "" {
+		return false
+	}
+	if entry.ProviderID != "selfhosted-openai" {
+		return true
+	}
+	return providerProbeOK(entry.BaseURL)
+}
+
+func providerProbeOK(baseURL string) bool {
+	client := http.Client{Timeout: 500 * time.Millisecond}
+	target := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if target == "" {
+		return false
+	}
+	req, err := http.NewRequest(http.MethodGet, target+"/models", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 400
 }
 
 func deriveSessionTitle(prompt string) string {
@@ -2453,7 +2661,7 @@ var approvalsPageTmpl = template.Must(template.New("approvals").Parse(`<!doctype
       {{range .Requests}}
         <article class="request">
           <strong>{{.ToolName}}</strong>
-          <div class="meta">Decision: {{if .Decision}}{{.Decision}}{{else}}pending{{end}} · Scope: {{if .Scope}}{{.Scope}}{{else}}pending{{end}}</div>
+          <div class="meta">Decision: {{if .Decision}}{{.Decision}}{{else}}pending{{end}} | Scope: {{if .Scope}}{{.Scope}}{{else}}pending{{end}}</div>
           <pre>{{index .Request "summary"}}</pre>
           {{if eq .Decision "pending"}}
             <form method="post" action="/dashboard/approvals/{{.ID}}/decision">
@@ -2678,8 +2886,8 @@ var sessionsPageTmpl = template.Must(template.New("sessions").Parse(`<!doctype h
     {{range .List}}
       <article class="item">
         <strong>{{.Title}}</strong>
-        <div>Status: {{.Status}} · Source: {{.Source}}</div>
-        <div><a href="/chat?session={{.ID}}">Open chat</a> · <a href="/dashboard/goals?session={{.ID}}">View goals</a></div>
+        <div>Status: {{.Status}} | Source: {{.Source}}</div>
+        <div><a href="/chat?session={{.ID}}">Open chat</a> | <a href="/dashboard/goals?session={{.ID}}">View goals</a></div>
       </article>
     {{else}}
       <p>No sessions yet.</p>
@@ -2709,7 +2917,7 @@ var goalsPageTmpl = template.Must(template.New("goals").Parse(`<!doctype html>
 <body>
   <section class="panel">
     <h1>Persistent Goals</h1>
-    <p><a href="/dashboard">Back to dashboard</a> · {{if .SelectedSessionID}}<a href="/chat?session={{.SelectedSessionID}}">Open session chat</a>{{end}}</p>
+    <p><a href="/dashboard">Back to dashboard</a> | {{if .SelectedSessionID}}<a href="/chat?session={{.SelectedSessionID}}">Open session chat</a>{{end}}</p>
     <div class="grid">
       <form method="get" action="/dashboard/goals">
         <h2>Session Focus</h2>
@@ -2760,7 +2968,7 @@ var goalsPageTmpl = template.Must(template.New("goals").Parse(`<!doctype html>
         {{range .ProfileGoals}}
           <article class="item">
             <strong>{{.Title}}</strong>
-            <div class="meta">{{.Status}} · {{.Priority}}</div>
+            <div class="meta">{{.Status}} | {{.Priority}}</div>
             <p>{{.Statement}}</p>
             <form method="post" action="/dashboard/goals/profile/{{.ID}}/save">
               <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -2811,7 +3019,7 @@ var goalsPageTmpl = template.Must(template.New("goals").Parse(`<!doctype html>
         {{range .SessionGoals}}
           <article class="item">
             <strong>{{.Title}}</strong>
-            <div class="meta">{{.Status}} · {{.Priority}}</div>
+            <div class="meta">{{.Status}} | {{.Priority}}</div>
             <p>{{.Statement}}</p>
             <form method="post" action="/dashboard/goals/session/{{.ID}}/save">
               <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -2882,7 +3090,7 @@ var runDetailPageTmpl = template.Must(template.New("run-detail").Parse(`<!doctyp
     {{range .Events}}
       <article class="event">
         <strong>{{.Type}}</strong>
-        <div>Sequence {{.Sequence}} · {{.Timestamp}}</div>
+        <div>Sequence {{.Sequence}} | {{.Timestamp}}</div>
         <pre>{{printf "%v" .Payload}}</pre>
       </article>
     {{else}}
@@ -2907,7 +3115,7 @@ var jobsPageTmpl = template.Must(template.New("jobs").Parse(`<!doctype html>
     {{range .Jobs}}
       <article class="item">
         <strong>{{.Name}}</strong>
-        <div>{{.ScheduleKind}} · {{.ScheduleValue}} · enabled={{.Enabled}}</div>
+        <div>{{.ScheduleKind}} | {{.ScheduleValue}} | enabled={{.Enabled}}</div>
         <div><a href="/dashboard/jobs?job={{.ID}}">History</a></div>
       </article>
     {{else}}
@@ -2953,8 +3161,8 @@ var batchesPageTmpl = template.Must(template.New("batches").Parse(`<!doctype htm
         {{range .Jobs}}
           <article class="item">
             <strong>{{.Name}}</strong>
-            <div>Status: {{.Status}} · Items: {{.CompletedCount}}/{{.ItemCount}} completed · Failed: {{.FailedCount}}</div>
-            <div>Model: {{.ModelID}} · Toolset: {{.Toolset}}</div>
+            <div>Status: {{.Status}} | Items: {{.CompletedCount}}/{{.ItemCount}} completed | Failed: {{.FailedCount}}</div>
+            <div>Model: {{.ModelID}} | Toolset: {{.Toolset}}</div>
             <div><a href="/dashboard/batches?job={{.ID}}">Inspect attempts</a></div>
             <form method="post" action="/dashboard/batches/{{.ID}}/run">
               <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -2974,7 +3182,7 @@ var batchesPageTmpl = template.Must(template.New("batches").Parse(`<!doctype htm
     {{range .Attempts}}
       <article class="item">
         <strong>{{.ItemID}}</strong>
-        <div>Status: {{.Status}} · Run: {{if .RunID}}{{.RunID}}{{else}}not started{{end}}</div>
+        <div>Status: {{.Status}} | Run: {{if .RunID}}{{.RunID}}{{else}}not started{{end}}</div>
         <div>{{.Prompt}}</div>
         <div>{{if .OutputText}}{{.OutputText}}{{else}}{{.ErrorMessage}}{{end}}</div>
       </article>
@@ -3002,7 +3210,7 @@ var adaptersPageTmpl = template.Must(template.New("adapters").Parse(`<!doctype h
     {{range .Items}}
       <article class="item">
         <strong>{{.Platform}}</strong>
-        <div class="meta">Status: {{.Status}} · Auth: {{if .AuthMode}}{{.AuthMode}}{{else}}unset{{end}} · Enabled: {{.Enabled}} · Last error: {{if .LastError}}{{.LastError}}{{else}}none{{end}}</div>
+        <div class="meta">Status: {{.Status}} | Auth: {{if .AuthMode}}{{.AuthMode}}{{else}}unset{{end}} | Enabled: {{.Enabled}} | Last error: {{if .LastError}}{{.LastError}}{{else}}none{{end}}</div>
         <div class="meta">Allowlist: {{if .Allowlist}}{{range .Allowlist}}{{.}} {{end}}{{else}}none{{end}}</div>
         <form method="post" action="/dashboard/adapters/{{.ID}}/save">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -3029,14 +3237,14 @@ var adaptersPageTmpl = template.Must(template.New("adapters").Parse(`<!doctype h
     {{range .PlatformCatalog}}
       <article class="item">
         <strong>{{.Name}}</strong>
-        <div class="meta">Phase {{.Phase}} · Auth placeholders: {{range .AuthPlaceholders}}{{.}} {{end}}</div>
+        <div class="meta">Phase {{.Phase}} | Auth placeholders: {{range .AuthPlaceholders}}{{.}} {{end}}</div>
       </article>
     {{end}}
     <h2>Recent Logs</h2>
     {{range .Logs}}
       <article class="log">
         <strong>{{.Platform}}</strong>
-        <div class="meta">{{.Direction}} · {{.Status}} · Session {{if .SessionKey}}{{.SessionKey}}{{else}}n/a{{end}}</div>
+        <div class="meta">{{.Direction}} | {{.Status}} | Session {{if .SessionKey}}{{.SessionKey}}{{else}}n/a{{end}}</div>
         <div>{{if .Summary}}{{.Summary}}{{else}}no summary{{end}}</div>
         <div class="meta">{{if .ErrorMessage}}{{.ErrorMessage}}{{else}}no error{{end}}</div>
       </article>
@@ -3062,7 +3270,7 @@ var skillsPageTmpl = template.Must(template.New("skills").Parse(`<!doctype html>
     {{range .Skills}}
       <article class="item">
         <strong>{{.Name}}</strong>
-        <div>Slug: {{.Slug}} · State: {{.State}} · Trust: {{.TrustLevel}}</div>
+        <div>Slug: {{.Slug}} | State: {{.State}} | Trust: {{.TrustLevel}}</div>
         <div>Path: {{.RootPath}}/{{.EntryFile}}</div>
       </article>
     {{else}}

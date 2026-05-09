@@ -117,6 +117,15 @@ type CreateRunInput struct {
 	ErrorMessage       string
 }
 
+type UpdateSessionInput struct {
+	Title           string
+	Status          string
+	ModelSnapshot   map[string]any
+	ToolsetSnapshot map[string]any
+	Metadata        map[string]any
+	Todo            []map[string]any
+}
+
 type UpdateRunInput struct {
 	StartedAt          time.Time
 	Status             string
@@ -251,6 +260,43 @@ func (s *Service) ReplaceSessionTodo(ctx context.Context, sessionID string, item
 	}
 	if err := s.app.SaveWithContext(ctx, record); err != nil {
 		return Session{}, fmt.Errorf("update session todo: %w", err)
+	}
+	return sessionFromRecord(record)
+}
+
+func (s *Service) UpdateSession(ctx context.Context, sessionID string, input UpdateSessionInput) (Session, error) {
+	record, err := s.app.FindRecordById(CollectionSessions, sessionID)
+	if err != nil {
+		return Session{}, fmt.Errorf("find session: %w", err)
+	}
+	if trimmed := strings.TrimSpace(input.Title); trimmed != "" {
+		record.Set("title", trimmed)
+	}
+	if trimmed := strings.TrimSpace(input.Status); trimmed != "" {
+		record.Set("status", trimmed)
+	}
+	if input.ModelSnapshot != nil {
+		if err := setJSON(record, "model_snapshot_json", input.ModelSnapshot); err != nil {
+			return Session{}, err
+		}
+	}
+	if input.ToolsetSnapshot != nil {
+		if err := setJSON(record, "toolset_snapshot_json", input.ToolsetSnapshot); err != nil {
+			return Session{}, err
+		}
+	}
+	if input.Metadata != nil {
+		if err := setJSON(record, "metadata_json", input.Metadata); err != nil {
+			return Session{}, err
+		}
+	}
+	if input.Todo != nil {
+		if err := setJSON(record, "todo_json", input.Todo); err != nil {
+			return Session{}, err
+		}
+	}
+	if err := s.app.SaveWithContext(ctx, record); err != nil {
+		return Session{}, fmt.Errorf("update session: %w", err)
 	}
 	return sessionFromRecord(record)
 }
@@ -597,6 +643,75 @@ func (s *Service) DeleteRun(ctx context.Context, runID string) error {
 
 		if err := txApp.Delete(runRecord); err != nil {
 			return fmt.Errorf("delete run: %w", err)
+		}
+		return nil
+	})
+}
+
+func (s *Service) DeleteSession(ctx context.Context, sessionID string) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return errors.New("session id is required")
+	}
+
+	return s.app.RunInTransaction(func(txApp core.App) error {
+		sessionRecord, err := txApp.FindRecordById(CollectionSessions, sessionID)
+		if err != nil {
+			return fmt.Errorf("find session: %w", err)
+		}
+
+		messageRecords, err := txApp.FindRecordsByFilter(
+			CollectionMessages,
+			"session_id = {:session_id}",
+			"",
+			0,
+			0,
+			dbx.Params{"session_id": sessionID},
+		)
+		if err != nil {
+			return fmt.Errorf("list session messages: %w", err)
+		}
+		for _, record := range messageRecords {
+			if err := txApp.Delete(record); err != nil {
+				return fmt.Errorf("delete session message: %w", err)
+			}
+		}
+
+		eventRecords, err := txApp.FindRecordsByFilter(
+			"agent_run_events",
+			"session_id = {:session_id}",
+			"",
+			0,
+			0,
+			dbx.Params{"session_id": sessionID},
+		)
+		if err != nil {
+			return fmt.Errorf("list session events: %w", err)
+		}
+		for _, record := range eventRecords {
+			if err := txApp.Delete(record); err != nil {
+				return fmt.Errorf("delete session event: %w", err)
+			}
+		}
+
+		runRecords, err := txApp.FindRecordsByFilter(
+			CollectionRuns,
+			"session_id = {:session_id}",
+			"",
+			0,
+			0,
+			dbx.Params{"session_id": sessionID},
+		)
+		if err != nil {
+			return fmt.Errorf("list session runs: %w", err)
+		}
+		for _, record := range runRecords {
+			if err := txApp.Delete(record); err != nil {
+				return fmt.Errorf("delete session run: %w", err)
+			}
+		}
+
+		if err := txApp.Delete(sessionRecord); err != nil {
+			return fmt.Errorf("delete session: %w", err)
 		}
 		return nil
 	})

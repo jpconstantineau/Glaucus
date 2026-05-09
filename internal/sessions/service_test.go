@@ -143,6 +143,87 @@ func TestCreateResumeAndListSessionData(t *testing.T) {
 	}
 }
 
+func TestUpdateAndDeleteSession(t *testing.T) {
+	app := newTestApp(t)
+	service := NewService(app)
+	ctx := context.Background()
+
+	session, err := service.CreateSession(ctx, CreateSessionInput{
+		ProfileID: "profile_default",
+		Source:    "web",
+		Title:     "Session to archive",
+		Status:    "active",
+		ModelSnapshot: map[string]any{
+			"provider": "ollama-local",
+			"model":    "llama3.2:3b",
+		},
+		ToolsetSnapshot: map[string]any{
+			"name": "safe",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	run, err := service.CreateRun(ctx, CreateRunInput{
+		ProfileID:     session.ProfileID,
+		SessionID:     session.ID,
+		TriggerSource: "web_chat",
+		Status:        "completed",
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := service.CreateMessage(ctx, CreateMessageInput{
+		ProfileID:   session.ProfileID,
+		SessionID:   session.ID,
+		RunID:       run.ID,
+		Role:        "assistant",
+		Content:     MessageContent{{Type: "output_text", Text: "Done"}},
+		VisibleText: "Done",
+	}); err != nil {
+		t.Fatalf("create message: %v", err)
+	}
+
+	updated, err := service.UpdateSession(ctx, session.ID, UpdateSessionInput{
+		Status: "archived",
+		ModelSnapshot: map[string]any{
+			"provider": "ollama-local",
+			"model":    "llama3.2:latest",
+		},
+	})
+	if err != nil {
+		t.Fatalf("update session: %v", err)
+	}
+	if updated.Status != "archived" {
+		t.Fatalf("expected archived session, got %#v", updated)
+	}
+	if updated.ModelSnapshot["model"] != "llama3.2:latest" {
+		t.Fatalf("expected updated model snapshot, got %#v", updated.ModelSnapshot)
+	}
+
+	if err := service.DeleteSession(ctx, session.ID); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+	if _, err := service.GetSession(ctx, session.ID); err == nil {
+		t.Fatal("expected deleted session lookup to fail")
+	}
+	messages, err := service.ListMessages(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("list messages after delete: %v", err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("expected messages to be deleted, got %#v", messages)
+	}
+	runs, err := service.ListRuns(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("list runs after delete: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("expected runs to be deleted, got %#v", runs)
+	}
+}
+
 func newTestApp(t *testing.T) core.App {
 	t.Helper()
 
