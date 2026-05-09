@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
+	batchsvc "github.com/jpconstantineau/Glaucus/internal/batch"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	"github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/goals"
@@ -56,6 +57,8 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	}
 	approvalService := approvals.NewService(app, config.Default().Approvals)
 	kanbanService := kanban.NewService(app)
+	sessionService := sessions.NewService(app)
+	eventService := runtime.NewEventService(app)
 	profileRoot := t.TempDir()
 	repoPluginsRoot := t.TempDir()
 	cfg := config.Default()
@@ -104,7 +107,8 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		SessionTTL:      24 * time.Hour,
 		Profile:         profile.ActiveProfile{Slug: "default", Root: profileRoot},
 		ProviderCatalog: providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1"}}},
-		SessionService:  sessions.NewService(app),
+		SessionService:  sessionService,
+		BatchService:    batchsvc.NewService(app, sessionService, eventService),
 		GoalService:     goals.NewService(app),
 		JobService:      jobs.NewService(app),
 		KanbanService:   kanbanService,
@@ -127,10 +131,10 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 			Commit:  "local",
 			BuiltAt: "now",
 		}),
-		EventService:            runtime.NewEventService(app),
+		EventService:            eventService,
 		PromptBuilder:           runtime.NewPromptBuilder(),
-		Orchestrator:            runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, cfg), runtime.NewEventService(app), registry, nil),
-		QueueManager:            kanban.NewQueueManager(kanbanService, sessions.NewService(app), runtime.NewOrchestrator(sessions.NewService(app), providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, cfg), runtime.NewEventService(app), registry, nil)),
+		Orchestrator:            runtime.NewOrchestrator(sessionService, providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, cfg), eventService, registry, nil),
+		QueueManager:            kanban.NewQueueManager(kanbanService, sessionService, runtime.NewOrchestrator(sessionService, providers.NewRouter(providers.Catalog{Entries: []providers.CatalogEntry{{ProviderID: "one", ModelID: "m1", Dialect: "openai-chat", BaseURL: "http://127.0.0.1:1", DisplayName: "Model One", Capabilities: []string{"chat"}}}}, cfg), eventService, registry, nil)),
 		ApprovalService:         approvalService,
 		ToolRegistry:            registry,
 		MCPService:              mcpService,
@@ -209,6 +213,9 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	if !strings.Contains(dashboardRes.Body.String(), "/dashboard/sessions") || !strings.Contains(dashboardRes.Body.String(), "/dashboard/jobs") {
 		t.Fatal("expected dashboard to link to operator console pages")
 	}
+	if !strings.Contains(dashboardRes.Body.String(), "/dashboard/batches") {
+		t.Fatal("expected dashboard to link to batch jobs page")
+	}
 	if !strings.Contains(dashboardRes.Body.String(), "/dashboard/adapters") {
 		t.Fatal("expected dashboard to link to adapters page")
 	}
@@ -268,6 +275,7 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	for _, path := range []string{
 		"/dashboard/sessions",
 		"/dashboard/goals",
+		"/dashboard/batches",
 		"/dashboard/jobs",
 		"/dashboard/adapters",
 		"/dashboard/skills",

@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	batchsvc "github.com/jpconstantineau/Glaucus/internal/batch"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
@@ -29,6 +33,7 @@ type Options struct {
 	ProviderCatalog providers.Catalog
 	Router          *providers.Router
 	SessionService  *sessions.Service
+	BatchService    *batchsvc.Service
 	GoalService     *goals.Service
 	JobService      *jobs.Service
 	EventService    *runtime.EventService
@@ -59,6 +64,11 @@ func (m *Module) BindRoutes(rg *router.Router[*core.RequestEvent]) {
 	rg.GET("/v1/runs/{runID}", m.withBearerAuth(m.runsGet))
 	rg.GET("/v1/runs/{runID}/events", m.withBearerAuth(m.runsEvents))
 	rg.POST("/v1/runs/{runID}/stop", m.withBearerAuth(m.runsStop))
+	rg.GET("/v1/batches", m.withBearerAuth(m.batchesList))
+	rg.POST("/v1/batches", m.withBearerAuth(m.batchesCreate))
+	rg.GET("/v1/batches/{jobID}", m.withBearerAuth(m.batchesGet))
+	rg.POST("/v1/batches/{jobID}/run", m.withBearerAuth(m.batchesRun))
+	rg.GET("/v1/batches/{jobID}/trajectory", m.withBearerAuth(m.batchesTrajectory))
 	rg.GET("/v1/jobs", m.withBearerAuth(m.jobsList))
 	rg.POST("/v1/jobs", m.withBearerAuth(m.jobsCreate))
 	rg.GET("/v1/jobs/{jobID}", m.withBearerAuth(m.jobsGet))
@@ -422,6 +432,19 @@ type goalsRequest struct {
 	Evaluation      map[string]any `json:"evaluation"`
 }
 
+type batchRequest struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider_id"`
+	Model    string `json:"model_id"`
+	Toolset  string `json:"toolset"`
+	CWD      string `json:"cwd"`
+	Items    []struct {
+		ID       string         `json:"id"`
+		Prompt   string         `json:"prompt"`
+		Metadata map[string]any `json:"metadata"`
+	} `json:"items"`
+}
+
 func (m *Module) jobsList(e *core.RequestEvent) error {
 	if m.options.JobService == nil {
 		return m.writeError(e, http.StatusServiceUnavailable, "job service unavailable")
@@ -435,6 +458,122 @@ func (m *Module) jobsList(e *core.RequestEvent) error {
 		data = append(data, renderJob(item, nil))
 	}
 	return e.JSON(http.StatusOK, map[string]any{"data": data})
+}
+
+func (m *Module) batchesList(e *core.RequestEvent) error {
+	if m.options.BatchService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "batch service unavailable")
+	}
+	items, err := m.options.BatchService.ListJobs(e.Request.Context(), m.options.Profile.Slug, 100)
+	if err != nil {
+		return m.writeError(e, http.StatusInternalServerError, err.Error())
+	}
+	data := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		data = append(data, renderBatch(item, nil))
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": data})
+}
+
+func (m *Module) batchesCreate(e *core.RequestEvent) error {
+	if m.options.BatchService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "batch service unavailable")
+	}
+	var req batchRequest
+	if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
+		return m.writeError(e, http.StatusBadRequest, "invalid request body")
+	}
+	items := make([]batchsvc.Item, 0, len(req.Items))
+	for _, item := range req.Items {
+		items = append(items, batchsvc.Item{
+			ID:       item.ID,
+			Prompt:   item.Prompt,
+			Metadata: item.Metadata,
+		})
+	}
+	job, _, err := m.options.BatchService.CreateJob(e.Request.Context(), batchsvc.CreateJobInput{
+		ProfileID:        m.options.Profile.Slug,
+		Name:             req.Name,
+		ProviderID:       fallbackString(req.Provider, m.options.Config.Model.DefaultProvider),
+		ModelID:          fallbackString(req.Model, m.options.Config.Model.DefaultModel),
+		Toolset:          fallbackString(req.Toolset, "safe"),
+		WorkingDirectory: fallbackString(req.CWD, m.options.Profile.Root),
+		CreatedBy:        "api",
+		Items:            items,
+		Metadata:         map[string]any{"surface": "api"},
+	})
+	if err != nil {
+		return m.writeError(e, http.StatusBadRequest, err.Error())
+	}
+	return e.JSON(http.StatusOK, renderBatch(job, nil))
+}
+
+func (m *Module) batchesGet(e *core.RequestEvent) error {
+	if m.options.BatchService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "batch service unavailable")
+	}
+	jobID := e.Request.PathValue("jobID")
+	job, err := m.options.BatchService.GetJob(e.Request.Context(), jobID)
+	if err != nil {
+		return m.writeError(e, http.StatusNotFound, "batch job not found")
+	}
+	attempts, err := m.options.BatchService.ListAttempts(e.Request.Context(), jobID)
+	if err != nil {
+		return m.writeError(e, http.StatusInternalServerError, err.Error())
+	}
+	return e.JSON(http.StatusOK, renderBatch(job, attempts))
+}
+
+func (m *Module) batchesRun(e *core.RequestEvent) error {
+	if m.options.BatchService == nil || m.options.SessionService == nil || m.options.PromptBuilder == nil || m.options.Orchestrator == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "batch runtime unavailable")
+	}
+	job, err := m.options.BatchService.GetJob(e.Request.Context(), e.Request.PathValue("jobID"))
+	if err != nil {
+		return m.writeError(e, http.StatusNotFound, "batch job not found")
+	}
+	result, err := m.batchExecutor().ExecuteJob(e.Request.Context(), m.options.BatchService, job)
+	if err != nil && result.JobID == "" {
+		return m.writeError(e, http.StatusBadGateway, err.Error())
+	}
+	return e.JSON(http.StatusOK, map[string]any{
+		"job_id":          result.JobID,
+		"completed_count": result.CompletedCount,
+		"failed_count":    result.FailedCount,
+		"attempted_count": result.AttemptedCount,
+		"status":          result.Status,
+		"export_path":     result.ExportPath,
+		"last_run_id":     result.LastRunID,
+		"last_output":     result.LastOutputText,
+		"last_error":      result.LastError,
+	})
+}
+
+func (m *Module) batchesTrajectory(e *core.RequestEvent) error {
+	if m.options.BatchService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "batch service unavailable")
+	}
+	jobID := e.Request.PathValue("jobID")
+	job, err := m.options.BatchService.GetJob(e.Request.Context(), jobID)
+	if err != nil {
+		return m.writeError(e, http.StatusNotFound, "batch job not found")
+	}
+	path := filepathFromProfile(m.options.Profile.Root, job.ExportPath)
+	if strings.TrimSpace(job.ExportPath) == "" {
+		bundle, exportErr := m.options.BatchService.WriteTrajectoryExport(e.Request.Context(), jobID, m.options.Profile.Root)
+		if exportErr != nil {
+			return m.writeError(e, http.StatusInternalServerError, exportErr.Error())
+		}
+		path = bundle.TrajectoryPath
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return m.writeError(e, http.StatusInternalServerError, err.Error())
+	}
+	defer file.Close()
+	e.Response.Header().Set("Content-Type", "application/x-ndjson")
+	_, err = io.Copy(e.Response, file)
+	return err
 }
 
 func (m *Module) jobsCreate(e *core.RequestEvent) error {
@@ -723,6 +862,7 @@ func (m *Module) capabilitiesGet(e *core.RequestEvent) error {
 			"runs",
 			"run.events",
 			"run.stop",
+			"batches",
 			"jobs",
 			"goals",
 			"models.list",
@@ -877,6 +1017,31 @@ func renderJob(job jobs.Job, history []jobs.JobRun) map[string]any {
 	return data
 }
 
+func renderBatch(job batchsvc.Job, attempts []batchsvc.Attempt) map[string]any {
+	data := map[string]any{
+		"id":                job.ID,
+		"name":              job.Name,
+		"schema_version":    job.SchemaVersion,
+		"status":            job.Status,
+		"provider_id":       job.ProviderID,
+		"model_id":          job.ModelID,
+		"toolset":           job.Toolset,
+		"working_directory": job.WorkingDirectory,
+		"item_count":        job.ItemCount,
+		"completed_count":   job.CompletedCount,
+		"failed_count":      job.FailedCount,
+		"created_by":        job.CreatedBy,
+		"export_path":       job.ExportPath,
+		"metadata":          job.Metadata,
+		"started_at":        job.StartedAt,
+		"ended_at":          job.EndedAt,
+	}
+	if attempts != nil {
+		data["attempts"] = attempts
+	}
+	return data
+}
+
 func (m *Module) writeError(e *core.RequestEvent, status int, message string) error {
 	return e.JSON(status, map[string]any{
 		"error": map[string]any{
@@ -975,6 +1140,25 @@ func errorString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func (m *Module) batchExecutor() batchsvc.RuntimeExecutor {
+	return batchsvc.RuntimeExecutor{
+		Profile:       m.options.Profile,
+		Config:        m.options.Config,
+		Sessions:      m.options.SessionService,
+		GoalService:   m.options.GoalService,
+		PromptBuilder: m.options.PromptBuilder,
+		Orchestrator:  m.options.Orchestrator,
+		ToolRegistry:  m.options.ToolRegistry,
+	}
+}
+
+func filepathFromProfile(root, relative string) string {
+	if relative == "" {
+		return ""
+	}
+	return filepath.Clean(filepath.Join(root, filepath.FromSlash(relative)))
 }
 
 func parseInt(raw string, fallback int) int {

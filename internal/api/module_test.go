@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	batchsvc "github.com/jpconstantineau/Glaucus/internal/batch"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
@@ -194,6 +195,7 @@ func TestRunsAndJobsAPIs(t *testing.T) {
 	cfg.Model.DefaultModel = "test-model"
 	eventService := runtime.NewEventService(app)
 	sessionService := sessions.NewService(app)
+	batchService := batchsvc.NewService(app, sessionService, eventService)
 	jobService := jobs.NewService(app)
 	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -217,6 +219,7 @@ func TestRunsAndJobsAPIs(t *testing.T) {
 		ProviderCatalog: catalog,
 		Router:          routerSvc,
 		SessionService:  sessionService,
+		BatchService:    batchService,
 		GoalService:     goals.NewService(app),
 		JobService:      jobService,
 		EventService:    eventService,
@@ -287,6 +290,56 @@ func TestRunsAndJobsAPIs(t *testing.T) {
 	mux.ServeHTTP(stopRes, stopReq)
 	if stopRes.Code != http.StatusOK || !strings.Contains(stopRes.Body.String(), runtime.RunStatusCancelled) {
 		t.Fatalf("expected cancelled run response, got %d %s", stopRes.Code, stopRes.Body.String())
+	}
+
+	batchReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/batches", strings.NewReader(`{
+		"name":"Trajectory sample",
+		"items":[
+			{"prompt":"first batch prompt"},
+			{"prompt":"second batch prompt"}
+		]
+	}`))
+	batchReq.Header.Set("Authorization", "Bearer test-token")
+	batchReq.Header.Set("Content-Type", "application/json")
+	batchRes := httptest.NewRecorder()
+	mux.ServeHTTP(batchRes, batchReq)
+	if batchRes.Code != http.StatusOK {
+		t.Fatalf("expected batch create 200, got %d: %s", batchRes.Code, batchRes.Body.String())
+	}
+	var batchPayload map[string]any
+	if err := json.Unmarshal(batchRes.Body.Bytes(), &batchPayload); err != nil {
+		t.Fatalf("decode batch response: %v", err)
+	}
+	batchID, _ := batchPayload["id"].(string)
+	if batchID == "" {
+		t.Fatal("expected batch id")
+	}
+
+	runBatchReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/batches/"+batchID+"/run", nil)
+	runBatchReq.SetPathValue("jobID", batchID)
+	runBatchReq.Header.Set("Authorization", "Bearer test-token")
+	runBatchRes := httptest.NewRecorder()
+	mux.ServeHTTP(runBatchRes, runBatchReq)
+	if runBatchRes.Code != http.StatusOK || !strings.Contains(runBatchRes.Body.String(), `"completed_count":2`) {
+		t.Fatalf("expected batch run payload, got %d %s", runBatchRes.Code, runBatchRes.Body.String())
+	}
+
+	getBatchReq := httptest.NewRequest(http.MethodGet, "http://example.com/v1/batches/"+batchID, nil)
+	getBatchReq.SetPathValue("jobID", batchID)
+	getBatchReq.Header.Set("Authorization", "Bearer test-token")
+	getBatchRes := httptest.NewRecorder()
+	mux.ServeHTTP(getBatchRes, getBatchReq)
+	if getBatchRes.Code != http.StatusOK || !strings.Contains(getBatchRes.Body.String(), `"attempts"`) {
+		t.Fatalf("expected batch detail payload, got %d %s", getBatchRes.Code, getBatchRes.Body.String())
+	}
+
+	trajReq := httptest.NewRequest(http.MethodGet, "http://example.com/v1/batches/"+batchID+"/trajectory", nil)
+	trajReq.SetPathValue("jobID", batchID)
+	trajReq.Header.Set("Authorization", "Bearer test-token")
+	trajRes := httptest.NewRecorder()
+	mux.ServeHTTP(trajRes, trajReq)
+	if trajRes.Code != http.StatusOK || !strings.Contains(trajRes.Body.String(), "batch.v1") {
+		t.Fatalf("expected trajectory export payload, got %d %s", trajRes.Code, trajRes.Body.String())
 	}
 
 	jobReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/jobs", strings.NewReader(`{

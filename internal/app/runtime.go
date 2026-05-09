@@ -9,6 +9,7 @@ import (
 
 	"github.com/jpconstantineau/Glaucus/internal/api"
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
+	batchsvc "github.com/jpconstantineau/Glaucus/internal/batch"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/features"
@@ -50,6 +51,8 @@ type Runtime struct {
 	config     config.Loaded
 	providers  providers.Catalog
 	sessions   *sessions.Service
+	batch      *batchsvc.Service
+	batchExec  batchsvc.RuntimeExecutor
 	jobs       *jobs.Service
 	kanban     *kanban.Service
 	queue      *kanban.QueueManager
@@ -141,6 +144,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		ProfileID: activeProfile.Slug,
 	}, nil, nil))
 	runtime.events = agentruntime.NewEventService(pb)
+	runtime.batch = batchsvc.NewService(pb, runtime.sessions, runtime.events)
 	runtime.prompts = agentruntime.NewPromptBuilder()
 	runtime.search = search.NewService(pb, runtime.sessions)
 	runtime.skills = skills.NewService(pb)
@@ -163,6 +167,15 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	runtime.features = features.NewService(pb)
 	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
+	runtime.batchExec = batchsvc.RuntimeExecutor{
+		Profile:       activeProfile,
+		Config:        loadedConfig.Config,
+		Sessions:      runtime.sessions,
+		GoalService:   runtime.goals,
+		PromptBuilder: runtime.prompts,
+		Orchestrator:  runtime.runs,
+		ToolRegistry:  runtime.tools,
+	}
 	runtime.queue = kanban.NewQueueManager(runtime.kanban, runtime.sessions, runtime.runs)
 	runtime.runs.SetHooks(hooks.NewBus())
 	runtime.runs.SetHooks(hooks.NewBus())
@@ -196,6 +209,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		Profile:                 activeProfile,
 		ProviderCatalog:         catalog,
 		SessionService:          runtime.sessions,
+		BatchService:            runtime.batch,
 		JobService:              runtime.jobs,
 		KanbanService:           runtime.kanban,
 		QueueManager:            runtime.queue,
@@ -224,6 +238,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		ProviderCatalog: catalog,
 		Router:          runtime.router,
 		SessionService:  runtime.sessions,
+		BatchService:    runtime.batch,
 		GoalService:     runtime.goals,
 		JobService:      runtime.jobs,
 		EventService:    runtime.events,
