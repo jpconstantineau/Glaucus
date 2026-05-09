@@ -11,12 +11,16 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
+	"github.com/jpconstantineau/Glaucus/internal/features"
+	"github.com/jpconstantineau/Glaucus/internal/hooks"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/kanban"
+	"github.com/jpconstantineau/Glaucus/internal/mcp"
 	"github.com/jpconstantineau/Glaucus/internal/memory"
 	"github.com/jpconstantineau/Glaucus/internal/messaging"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
+	"github.com/jpconstantineau/Glaucus/internal/plugins"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	agentruntime "github.com/jpconstantineau/Glaucus/internal/runtime"
@@ -53,6 +57,9 @@ type Runtime struct {
 	search     *search.Service
 	skills     *skills.Service
 	exports    *exportsvc.Service
+	mcp        *mcp.Service
+	plugins    *plugins.Service
+	features   *features.Service
 	curator    *skills.Curator
 	metrics    *observability.Service
 	scheduler  *jobs.Scheduler
@@ -148,9 +155,14 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	tools.RegisterJobTools(runtime.tools, jobToolAdapter{service: runtime.jobs})
 	tools.RegisterPlanningTools(runtime.tools, todoToolAdapter{service: runtime.sessions}, memoryToolAdapter{service: runtime.memory, profileRoot: activeProfile.Root}, searchToolAdapter{service: runtime.search})
 	tools.RegisterSkillsTools(runtime.tools, skillsToolAdapter{service: runtime.skills, profileRoot: activeProfile.Root})
+	runtime.mcp = mcp.NewService(pb)
+	runtime.plugins = plugins.NewService(pb)
+	runtime.features = features.NewService(pb)
 	approvalService := approvals.NewService(pb, loadedConfig.Config.Approvals)
 	runtime.runs = agentruntime.NewOrchestrator(runtime.sessions, runtime.router, runtime.events, runtime.tools, approvalService)
 	runtime.queue = kanban.NewQueueManager(runtime.kanban, runtime.sessions, runtime.runs)
+	runtime.runs.SetHooks(hooks.NewBus())
+	runtime.runs.SetHooks(hooks.NewBus())
 	pollInterval, err := time.ParseDuration(loadedConfig.Config.Cron.PollInterval)
 	if err != nil || pollInterval <= 0 {
 		pollInterval = time.Minute
@@ -187,6 +199,9 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		MessagingGateway:        runtime.messaging,
 		SkillsService:           runtime.skills,
 		ExportService:           runtime.exports,
+		MCPService:              runtime.mcp,
+		PluginService:           runtime.plugins,
+		FeatureService:          runtime.features,
 		ObservabilityService:    runtime.metrics,
 		Scheduler:               runtime.scheduler,
 		EventService:            runtime.events,
@@ -216,7 +231,19 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		bindAddress:      loadedConfig.Config.Web.BindAddress,
 		operatorEmail:    "admin@glaucus.local",
 		operatorPassword: "glaucus-admin",
-		serveDone:        make(chan error, 1),
+		onAfterBootstrap: func(ctx context.Context) error {
+			if err := runtime.mcp.Reconcile(ctx, loadedConfig.Config, runtime.tools); err != nil {
+				return fmt.Errorf("reconcile mcp config: %w", err)
+			}
+			if err := runtime.plugins.Reconcile(ctx, activeProfile.Root, loadedConfig.Config.Plugins); err != nil {
+				return fmt.Errorf("reconcile plugins: %w", err)
+			}
+			if err := runtime.features.Reconcile(ctx); err != nil {
+				return fmt.Errorf("reconcile feature contracts: %w", err)
+			}
+			return nil
+		},
+		serveDone: make(chan error, 1),
 	}
 	runtime.lifecycle.Add(runtime.server)
 	runtime.lifecycle.Add(runtime.scheduler)
@@ -251,6 +278,7 @@ type pocketbaseService struct {
 	bindAddress      string
 	operatorEmail    string
 	operatorPassword string
+	onAfterBootstrap func(context.Context) error
 	serveDone        chan error
 }
 
@@ -264,6 +292,11 @@ func (s *pocketbaseService) Start(context.Context) error {
 	}
 	if err := s.app.RunAllMigrations(); err != nil {
 		return err
+	}
+	if s.onAfterBootstrap != nil {
+		if err := s.onAfterBootstrap(context.Background()); err != nil {
+			return err
+		}
 	}
 	if err := web.EnsureDefaultOperator(s.app, s.operatorEmail, s.operatorPassword); err != nil {
 		return err

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -14,6 +15,7 @@ type Manifest struct {
 	ProviderID  string            `yaml:"providerId"`
 	DisplayName string            `yaml:"displayName"`
 	Family      string            `yaml:"family"`
+	Category    string            `yaml:"category"`
 	BaseURL     string            `yaml:"baseURL"`
 	Dialect     string            `yaml:"dialect"`
 	Headers     map[string]string `yaml:"headers"`
@@ -40,17 +42,18 @@ type HeaderRequirement struct {
 }
 
 type CatalogEntry struct {
-	ProviderID      string
-	ModelID         string
-	DisplayName     string
-	ProviderFamily  string
-	Capabilities    []string
-	LifecycleStatus string
-	BaseURL         string
-	Dialect         string
-	Limits          ManifestLimits
-	RequiredHeaders []HeaderRequirement
-	DefaultHeaders  map[string]string
+	ProviderID       string
+	ModelID          string
+	DisplayName      string
+	ProviderFamily   string
+	ProviderCategory string
+	Capabilities     []string
+	LifecycleStatus  string
+	BaseURL          string
+	Dialect          string
+	Limits           ManifestLimits
+	RequiredHeaders  []HeaderRequirement
+	DefaultHeaders   map[string]string
 }
 
 type Catalog struct {
@@ -85,17 +88,18 @@ func LoadCatalog(dir string) (Catalog, error) {
 			seen[key] = struct{}{}
 
 			entries = append(entries, CatalogEntry{
-				ProviderID:      manifest.ProviderID,
-				ModelID:         model.ProviderModelID,
-				DisplayName:     model.DisplayName,
-				ProviderFamily:  manifest.Family,
-				Capabilities:    append([]string{}, model.Capabilities...),
-				LifecycleStatus: model.LifecycleStatus,
-				BaseURL:         manifest.BaseURL,
-				Dialect:         manifest.Dialect,
-				Limits:          model.Limits,
-				RequiredHeaders: append([]HeaderRequirement{}, model.RequiredHeaders...),
-				DefaultHeaders:  cloneHeaders(manifest.Headers),
+				ProviderID:       manifest.ProviderID,
+				ModelID:          model.ProviderModelID,
+				DisplayName:      model.DisplayName,
+				ProviderFamily:   manifest.Family,
+				ProviderCategory: fallbackCategory(manifest.Category),
+				Capabilities:     append([]string{}, model.Capabilities...),
+				LifecycleStatus:  model.LifecycleStatus,
+				BaseURL:          manifest.BaseURL,
+				Dialect:          manifest.Dialect,
+				Limits:           model.Limits,
+				RequiredHeaders:  append([]HeaderRequirement{}, model.RequiredHeaders...),
+				DefaultHeaders:   cloneHeaders(manifest.Headers),
 			})
 		}
 	}
@@ -148,6 +152,13 @@ func validateManifest(manifest Manifest) error {
 	}
 
 	return nil
+}
+
+func fallbackCategory(category string) string {
+	if category = strings.TrimSpace(category); category != "" {
+		return category
+	}
+	return "text_generation"
 }
 
 func cloneHeaders(headers map[string]string) map[string]string {

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	"github.com/jpconstantineau/Glaucus/internal/hooks"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
@@ -149,6 +150,34 @@ func TestOrchestratorExecuteCancellation(t *testing.T) {
 	}
 	if result.Run.Status != RunStatusCancelled {
 		t.Fatalf("expected cancelled status, got %#v", result.Run)
+	}
+}
+
+func TestOrchestratorBlocksRunWhenHookDeniesRequest(t *testing.T) {
+	router := newTestRouter(t, []providers.CatalogEntry{chatEntry("primary", "")}, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "should not execute", http.StatusInternalServerError)
+	})
+	service := sessions.NewService(newRuntimeTestApp(t))
+	orch := NewOrchestrator(service, router, nil, nil, nil)
+	bus := hooks.NewBus()
+	bus.AddRunBlock("policy.block", 10, func(_ context.Context, input hooks.RunContext) hooks.BlockDecision {
+		return hooks.BlockDecision{Blocked: true, Reason: "blocked by policy", Audit: map[string]any{"slot": "pre_provider"}}
+	})
+	orch.SetHooks(bus)
+	session := createRuntimeTestSession(t, service)
+
+	result, err := orch.Execute(context.Background(), ExecuteRunInput{
+		ProfileID:     session.ProfileID,
+		SessionID:     session.ID,
+		TriggerSource: "web_chat",
+		UserMessageID: "msg_user_5",
+		Request: providers.NormalizedRequest{
+			Messages: []providers.RequestMessage{{Role: "user", Content: "blocked"}},
+		},
+		Resolution: providers.ResolutionInput{ProviderID: "primary", ModelID: "chat-primary", RequiredCapabilities: []string{"chat"}},
+	})
+	if err == nil || result.Run.Status != RunStatusFailed || result.Run.ErrorCode != "hook_blocked" {
+		t.Fatalf("expected hook-blocked run failure, got result=%#v err=%v", result, err)
 	}
 }
 

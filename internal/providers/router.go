@@ -42,22 +42,29 @@ type ResolutionInput struct {
 	ProviderID           string
 	ModelID              string
 	RequiredCapabilities []string
+	AuxiliarySlot        string
+	CredentialIndex      int
 }
 
 type FallbackTarget struct {
-	ProviderID string `json:"provider_id"`
-	ModelID    string `json:"model_id"`
-	Dialect    string `json:"dialect"`
+	ProviderID      string `json:"provider_id"`
+	ModelID         string `json:"model_id"`
+	Dialect         string `json:"dialect"`
+	CredentialIndex int    `json:"credential_index,omitempty"`
+	RetryOnly       bool   `json:"retry_only,omitempty"`
 }
 
 type Resolution struct {
-	ProviderID       string            `json:"provider_id"`
-	ModelID          string            `json:"model_id"`
-	BaseURL          string            `json:"base_url"`
-	Dialect          string            `json:"dialect"`
-	CredentialSource string            `json:"credential_source,omitempty"`
-	Headers          map[string]string `json:"headers,omitempty"`
-	FallbackPlan     []FallbackTarget  `json:"fallback_plan,omitempty"`
+	ProviderID       string                     `json:"provider_id"`
+	ModelID          string                     `json:"model_id"`
+	BaseURL          string                     `json:"base_url"`
+	Dialect          string                     `json:"dialect"`
+	CredentialSource string                     `json:"credential_source,omitempty"`
+	CredentialPool   string                     `json:"credential_pool,omitempty"`
+	CredentialIndex  int                        `json:"credential_index,omitempty"`
+	Headers          map[string]string          `json:"headers,omitempty"`
+	RoutingPolicy    config.RoutingPolicyConfig `json:"routing_policy"`
+	FallbackPlan     []FallbackTarget           `json:"fallback_plan,omitempty"`
 }
 
 type AttemptRecord struct {
@@ -88,6 +95,7 @@ func NewRouter(catalog Catalog, cfg config.Config) *Router {
 }
 
 func (r *Router) Resolve(input ResolutionInput) (Resolution, error) {
+	input = r.applyAuxiliaryDefaults(input)
 	entry, err := r.selectEntry(input)
 	if err != nil {
 		return Resolution{}, err
@@ -95,6 +103,8 @@ func (r *Router) Resolve(input ResolutionInput) (Resolution, error) {
 
 	headers := cloneHeaders(entry.DefaultHeaders)
 	credentialSource := ""
+	credentialPool := ""
+	credentialIndex := input.CredentialIndex
 	if providerCfg, ok := r.config.Providers[entry.ProviderID]; ok {
 		if providerCfg.BaseURL != "" {
 			entry.BaseURL = providerCfg.BaseURL
@@ -111,10 +121,36 @@ func (r *Router) Resolve(input ResolutionInput) (Resolution, error) {
 				applyAuthHeader(headers, entry.Dialect, credential)
 				credentialSource = "env:" + providerCfg.Auth.Env
 			}
+		} else if providerCfg.CredentialPool != "" {
+			credentialPool = providerCfg.CredentialPool
+			pool := r.config.CredentialPools[providerCfg.CredentialPool]
+			if credentialIndex < 0 || credentialIndex >= len(pool.Credentials) {
+				credentialIndex = 0
+			}
+			if len(pool.Credentials) > 0 {
+				source := pool.Credentials[credentialIndex]
+				credential := strings.TrimSpace(os.Getenv(source.Env))
+				if credential != "" {
+					applyAuthHeader(headers, entry.Dialect, credential)
+					credentialSource = fmt.Sprintf("credential_pool:%s[%d]", providerCfg.CredentialPool, credentialIndex)
+				}
+			}
 		}
 	}
 
 	fallbackPlan := make([]FallbackTarget, 0)
+	if credentialPool != "" {
+		pool := r.config.CredentialPools[credentialPool]
+		for idx := credentialIndex + 1; idx < len(pool.Credentials); idx++ {
+			fallbackPlan = append(fallbackPlan, FallbackTarget{
+				ProviderID:      entry.ProviderID,
+				ModelID:         entry.ModelID,
+				Dialect:         entry.Dialect,
+				CredentialIndex: idx,
+				RetryOnly:       true,
+			})
+		}
+	}
 	for _, candidate := range r.orderedFallbacks(entry, input.RequiredCapabilities) {
 		fallbackPlan = append(fallbackPlan, FallbackTarget{
 			ProviderID: candidate.ProviderID,
@@ -129,7 +165,10 @@ func (r *Router) Resolve(input ResolutionInput) (Resolution, error) {
 		BaseURL:          entry.BaseURL,
 		Dialect:          entry.Dialect,
 		CredentialSource: credentialSource,
+		CredentialPool:   credentialPool,
+		CredentialIndex:  credentialIndex,
 		Headers:          headers,
+		RoutingPolicy:    r.config.Routing,
 		FallbackPlan:     fallbackPlan,
 	}, nil
 }
@@ -154,21 +193,29 @@ func (r *Router) ExecuteWithFallback(ctx context.Context, input ResolutionInput,
 	}
 
 	candidates := []FallbackTarget{{
-		ProviderID: resolution.ProviderID,
-		ModelID:    resolution.ModelID,
-		Dialect:    resolution.Dialect,
+		ProviderID:      resolution.ProviderID,
+		ModelID:         resolution.ModelID,
+		Dialect:         resolution.Dialect,
+		CredentialIndex: resolution.CredentialIndex,
 	}}
 	candidates = append(candidates, resolution.FallbackPlan...)
 
 	attempts := make([]AttemptRecord, 0, len(candidates))
+	lastRetryable := true
 	for idx, candidate := range candidates {
+		if candidate.RetryOnly && !lastRetryable {
+			continue
+		}
 		started := time.Now().UTC()
 		candidateResolution, err := r.Resolve(ResolutionInput{
 			ProviderID:           candidate.ProviderID,
 			ModelID:              candidate.ModelID,
 			RequiredCapabilities: input.RequiredCapabilities,
+			AuxiliarySlot:        input.AuxiliarySlot,
+			CredentialIndex:      candidate.CredentialIndex,
 		})
 		if err != nil {
+			lastRetryable = false
 			attempts = append(attempts, AttemptRecord{
 				Index:      idx + 1,
 				ProviderID: candidate.ProviderID,
@@ -182,6 +229,7 @@ func (r *Router) ExecuteWithFallback(ctx context.Context, input ResolutionInput,
 		}
 
 		response, execErr := r.Execute(ctx, candidateResolution, request)
+		lastRetryable = isRetryable(execErr)
 		attempt := AttemptRecord{
 			Index:      idx + 1,
 			ProviderID: candidateResolution.ProviderID,
@@ -217,8 +265,9 @@ func (r *Router) selectEntry(input ResolutionInput) (CatalogEntry, error) {
 	if modelID == "" {
 		modelID = strings.TrimSpace(r.config.Model.DefaultModel)
 	}
-
-	var candidate *CatalogEntry
+	requiredCapabilities := append([]string{}, input.RequiredCapabilities...)
+	requiredCapabilities = append(requiredCapabilities, r.config.Routing.RequiredCapabilities...)
+	candidates := make([]CatalogEntry, 0, len(entries))
 	for _, entry := range entries {
 		if providerID != "" && entry.ProviderID != providerID {
 			continue
@@ -226,39 +275,55 @@ func (r *Router) selectEntry(input ResolutionInput) (CatalogEntry, error) {
 		if modelID != "" && entry.ModelID != modelID {
 			continue
 		}
-		if !supportsCapabilities(entry.Capabilities, input.RequiredCapabilities) {
+		if containsString(r.config.Routing.DeniedProviders, entry.ProviderID) {
 			continue
 		}
-		entryCopy := entry
-		candidate = &entryCopy
-		break
+		if !supportsCapabilities(entry.Capabilities, requiredCapabilities) {
+			continue
+		}
+		candidates = append(candidates, entry)
 	}
-
-	if candidate == nil {
+	if len(candidates) == 0 && modelID != "" {
 		for _, entry := range entries {
 			if providerID != "" && entry.ProviderID != providerID {
 				continue
 			}
-			if !supportsCapabilities(entry.Capabilities, input.RequiredCapabilities) {
+			if containsString(r.config.Routing.DeniedProviders, entry.ProviderID) {
 				continue
 			}
-			entryCopy := entry
-			candidate = &entryCopy
-			break
+			if !supportsCapabilities(entry.Capabilities, requiredCapabilities) {
+				continue
+			}
+			candidates = append(candidates, entry)
 		}
 	}
-
-	if candidate == nil {
+	if len(candidates) == 0 {
+		for _, entry := range entries {
+			if containsString(r.config.Routing.DeniedProviders, entry.ProviderID) {
+				continue
+			}
+			if !supportsCapabilities(entry.Capabilities, requiredCapabilities) {
+				continue
+			}
+			candidates = append(candidates, entry)
+		}
+	}
+	if len(candidates) == 0 {
 		return CatalogEntry{}, fmt.Errorf("no provider/model found for provider=%q model=%q", providerID, modelID)
 	}
-
-	return *candidate, nil
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return r.compareEntries(candidates[i], candidates[j], providerID, modelID)
+	})
+	return candidates[0], nil
 }
 
 func (r *Router) orderedFallbacks(primary CatalogEntry, required []string) []CatalogEntry {
 	candidates := make([]CatalogEntry, 0, len(r.catalog.Entries))
 	for _, entry := range r.catalog.Entries {
 		if entry.ProviderID == primary.ProviderID && entry.ModelID == primary.ModelID {
+			continue
+		}
+		if containsString(r.config.Routing.DeniedProviders, entry.ProviderID) {
 			continue
 		}
 		if !supportsCapabilities(entry.Capabilities, required) {
@@ -268,16 +333,7 @@ func (r *Router) orderedFallbacks(primary CatalogEntry, required []string) []Cat
 	}
 
 	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].ProviderID == primary.ProviderID && candidates[j].ProviderID != primary.ProviderID {
-			return true
-		}
-		if candidates[i].ProviderID != primary.ProviderID && candidates[j].ProviderID == primary.ProviderID {
-			return false
-		}
-		if candidates[i].ProviderID == candidates[j].ProviderID {
-			return candidates[i].ModelID < candidates[j].ModelID
-		}
-		return candidates[i].ProviderID < candidates[j].ProviderID
+		return r.compareEntries(candidates[i], candidates[j], primary.ProviderID, primary.ModelID)
 	})
 
 	return candidates
@@ -455,7 +511,7 @@ func (r *Router) doJSON(ctx context.Context, method string, resolution Resolutio
 
 	res, err := r.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("execute provider request: %w", err)
+		return nil, &ProviderError{Message: fmt.Sprintf("execute provider request: %v", err), Retryable: true}
 	}
 	defer res.Body.Close()
 
@@ -464,7 +520,11 @@ func (r *Router) doJSON(ctx context.Context, method string, resolution Resolutio
 		return nil, fmt.Errorf("read provider response: %w", err)
 	}
 	if res.StatusCode >= 400 {
-		return nil, fmt.Errorf("provider returned %d: %s", res.StatusCode, strings.TrimSpace(string(payload)))
+		return nil, &ProviderError{
+			StatusCode: res.StatusCode,
+			Message:    fmt.Sprintf("provider returned %d: %s", res.StatusCode, strings.TrimSpace(string(payload))),
+			Retryable:  res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500,
+		}
 	}
 
 	if err := json.Unmarshal(payload, target); err != nil {
@@ -509,4 +569,91 @@ func fallbackString(primary, fallback string) string {
 		return primary
 	}
 	return fallback
+}
+
+type ProviderError struct {
+	StatusCode int
+	Message    string
+	Retryable  bool
+}
+
+func (e *ProviderError) Error() string {
+	return e.Message
+}
+
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) {
+		return providerErr.Retryable
+	}
+	return false
+}
+
+func (r *Router) applyAuxiliaryDefaults(input ResolutionInput) ResolutionInput {
+	if strings.TrimSpace(input.AuxiliarySlot) == "" {
+		return input
+	}
+	slotCfg, ok := r.config.AuxiliaryRouting[input.AuxiliarySlot]
+	if !ok {
+		return input
+	}
+	if input.ProviderID == "" && strings.TrimSpace(slotCfg.ProviderID) != "" {
+		input.ProviderID = slotCfg.ProviderID
+	}
+	if input.ModelID == "" && strings.TrimSpace(slotCfg.ModelID) != "" {
+		input.ModelID = slotCfg.ModelID
+	}
+	return input
+}
+
+func (r *Router) compareEntries(left, right CatalogEntry, providerID, modelID string) bool {
+	leftScore := r.entryScore(left, providerID, modelID)
+	rightScore := r.entryScore(right, providerID, modelID)
+	if leftScore != rightScore {
+		return leftScore < rightScore
+	}
+	if left.ProviderID == right.ProviderID {
+		return left.ModelID < right.ModelID
+	}
+	return left.ProviderID < right.ProviderID
+}
+
+func (r *Router) entryScore(entry CatalogEntry, providerID, modelID string) int {
+	score := 100
+	if providerID != "" && entry.ProviderID == providerID {
+		score -= 50
+	}
+	if modelID != "" && entry.ModelID == modelID {
+		score -= 30
+	}
+	if idx := indexOf(r.config.Routing.PreferredProviders, entry.ProviderID); idx >= 0 {
+		score -= 20 - min(idx, 19)
+	}
+	if idx := indexOf(r.config.Routing.FallbackOrder, entry.ProviderID); idx >= 0 {
+		score -= 10 - min(idx, 9)
+	}
+	return score
+}
+
+func containsString(values []string, target string) bool {
+	return indexOf(values, target) >= 0
+}
+
+func indexOf(values []string, target string) int {
+	for idx, value := range values {
+		if value == target {
+			return idx
+		}
+	}
+	return -1
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
