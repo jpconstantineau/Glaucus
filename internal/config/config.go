@@ -1,21 +1,25 @@
 package config
 
 type Config struct {
-	Model      ModelConfig                `yaml:"model"`
-	Providers  map[string]ProviderConfig  `yaml:"providers"`
-	Agent      AgentConfig                `yaml:"agent"`
-	Approvals  ApprovalsConfig            `yaml:"approvals"`
-	Cron       CronConfig                 `yaml:"cron"`
-	Browser    BrowserConfig              `yaml:"browser"`
-	Gateway    GatewayConfig              `yaml:"gateway"`
-	Web        WebConfig                  `yaml:"web"`
-	API        APIConfig                  `yaml:"api"`
-	PocketBase PocketBaseConfig           `yaml:"pocketbase"`
-	Profiles   ProfilesConfig             `yaml:"profiles"`
-	Skills     SkillsConfig               `yaml:"skills"`
-	MCPServers map[string]MCPServerConfig `yaml:"mcpServers"`
-	Plugins    PluginsConfig              `yaml:"plugins"`
-	Auxiliary  map[string]map[string]any  `yaml:"auxiliary"`
+	Model            ModelConfig                     `yaml:"model"`
+	Providers        map[string]ProviderConfig       `yaml:"providers"`
+	MediaProviders   map[string]ProviderConfig       `yaml:"mediaProviders"`
+	Agent            AgentConfig                     `yaml:"agent"`
+	Approvals        ApprovalsConfig                 `yaml:"approvals"`
+	Cron             CronConfig                      `yaml:"cron"`
+	Browser          BrowserConfig                   `yaml:"browser"`
+	Gateway          GatewayConfig                   `yaml:"gateway"`
+	Web              WebConfig                       `yaml:"web"`
+	API              APIConfig                       `yaml:"api"`
+	PocketBase       PocketBaseConfig                `yaml:"pocketbase"`
+	Profiles         ProfilesConfig                  `yaml:"profiles"`
+	Skills           SkillsConfig                    `yaml:"skills"`
+	MCPServers       map[string]MCPServerConfig      `yaml:"mcpServers"`
+	Plugins          PluginsConfig                   `yaml:"plugins"`
+	CredentialPools  map[string]CredentialPoolConfig `yaml:"credentialPools"`
+	Routing          RoutingPolicyConfig             `yaml:"routing"`
+	AuxiliaryRouting map[string]AuxiliaryRouteConfig `yaml:"auxiliaryRouting"`
+	Auxiliary        map[string]map[string]any       `yaml:"auxiliary"`
 }
 
 type ModelConfig struct {
@@ -24,10 +28,11 @@ type ModelConfig struct {
 }
 
 type ProviderConfig struct {
-	BaseURL string            `yaml:"baseURL"`
-	Dialect string            `yaml:"dialect"`
-	Auth    ProviderAuth      `yaml:"auth"`
-	Headers map[string]string `yaml:"headers"`
+	BaseURL        string            `yaml:"baseURL"`
+	Dialect        string            `yaml:"dialect"`
+	Auth           ProviderAuth      `yaml:"auth"`
+	CredentialPool string            `yaml:"credentialPool"`
+	Headers        map[string]string `yaml:"headers"`
 }
 
 type ProviderAuth struct {
@@ -80,13 +85,53 @@ type SkillsConfig struct {
 }
 
 type MCPServerConfig struct {
-	Command string   `yaml:"command"`
-	Args    []string `yaml:"args"`
+	Command string          `yaml:"command"`
+	Args    []string        `yaml:"args"`
+	Tools   []MCPToolConfig `yaml:"tools"`
+}
+
+type MCPToolConfig struct {
+	Name              string         `yaml:"name"`
+	Description       string         `yaml:"description"`
+	InputSchema       map[string]any `yaml:"inputSchema"`
+	Toolsets          []string       `yaml:"toolsets"`
+	AllowedSurfaces   []string       `yaml:"allowedSurfaces"`
+	Interactive       bool           `yaml:"interactive"`
+	ApprovalSensitive bool           `yaml:"approvalSensitive"`
+	ReadOnly          bool           `yaml:"readOnly"`
+	PlatformScoped    bool           `yaml:"platformScoped"`
 }
 
 type PluginsConfig struct {
 	RepoPaths    []string `yaml:"repoPaths"`
 	ProfilePaths []string `yaml:"profilePaths"`
+}
+
+type CredentialPoolConfig struct {
+	Credentials        []CredentialSourceConfig `yaml:"credentials"`
+	Rotation           string                   `yaml:"rotation"`
+	InheritToSubagents bool                     `yaml:"inheritToSubagents"`
+}
+
+type CredentialSourceConfig struct {
+	Env   string `yaml:"env"`
+	Label string `yaml:"label"`
+}
+
+type RoutingPolicyConfig struct {
+	PreferredProviders   []string `yaml:"preferredProviders"`
+	DeniedProviders      []string `yaml:"deniedProviders"`
+	CostBias             string   `yaml:"costBias"`
+	LatencyBias          string   `yaml:"latencyBias"`
+	ThroughputBias       string   `yaml:"throughputBias"`
+	RequiredCapabilities []string `yaml:"requiredCapabilities"`
+	FallbackOrder        []string `yaml:"fallbackOrder"`
+}
+
+type AuxiliaryRouteConfig struct {
+	RouteMode  string `yaml:"routeMode"`
+	ProviderID string `yaml:"providerId"`
+	ModelID    string `yaml:"modelId"`
 }
 
 func Default() Config {
@@ -95,7 +140,8 @@ func Default() Config {
 			DefaultProvider: "ollama-local",
 			DefaultModel:    "llama3.2:3b",
 		},
-		Providers: map[string]ProviderConfig{},
+		Providers:      map[string]ProviderConfig{},
+		MediaProviders: map[string]ProviderConfig{},
 		Agent: AgentConfig{
 			MaxTurns:        32,
 			BusyInputPolicy: "queue",
@@ -136,6 +182,9 @@ func Default() Config {
 			RepoPaths:    []string{".agents/plugins"},
 			ProfilePaths: []string{"plugins"},
 		},
-		Auxiliary: map[string]map[string]any{},
+		CredentialPools:  map[string]CredentialPoolConfig{},
+		Routing:          RoutingPolicyConfig{},
+		AuxiliaryRouting: map[string]AuxiliaryRouteConfig{},
+		Auxiliary:        map[string]map[string]any{},
 	}
 }

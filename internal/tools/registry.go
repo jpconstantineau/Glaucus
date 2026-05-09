@@ -86,6 +86,19 @@ type BrowserBackend interface {
 	Healthy(ctx context.Context) error
 }
 
+type BrowserCapabilities struct {
+	Recording bool   `json:"recording"`
+	Stealth   bool   `json:"stealth"`
+	Proxies   bool   `json:"proxies"`
+	KeepAlive bool   `json:"keepalive"`
+	LiveView  bool   `json:"live_view"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+type BrowserCapabilityReporter interface {
+	Capabilities(ctx context.Context) BrowserCapabilities
+}
+
 type Toolset struct {
 	Name        string
 	Description string
@@ -158,6 +171,36 @@ func (r *Registry) AddToolset(toolset Toolset) {
 		return
 	}
 	r.toolsets[toolset.Name] = toolset
+}
+
+func (r *Registry) AppendToolToToolset(toolsetName string, toolNames ...string) {
+	toolsetName = strings.TrimSpace(toolsetName)
+	if toolsetName == "" {
+		return
+	}
+
+	toolset, ok := r.toolsets[toolsetName]
+	if !ok {
+		toolset = Toolset{Name: toolsetName}
+	}
+
+	existing := map[string]struct{}{}
+	for _, name := range toolset.Tools {
+		existing[name] = struct{}{}
+	}
+	for _, name := range toolNames {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := existing[trimmed]; ok {
+			continue
+		}
+		toolset.Tools = append(toolset.Tools, trimmed)
+		existing[trimmed] = struct{}{}
+	}
+
+	r.toolsets[toolsetName] = toolset
 }
 
 func (r *Registry) ToolsetNames() []string {

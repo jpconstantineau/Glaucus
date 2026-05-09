@@ -20,9 +20,12 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
+	"github.com/jpconstantineau/Glaucus/internal/features"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
+	"github.com/jpconstantineau/Glaucus/internal/mcp"
 	"github.com/jpconstantineau/Glaucus/internal/messaging"
 	"github.com/jpconstantineau/Glaucus/internal/observability"
+	"github.com/jpconstantineau/Glaucus/internal/plugins"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
 	"github.com/jpconstantineau/Glaucus/internal/runtime"
@@ -54,6 +57,9 @@ type Options struct {
 	MessagingGateway        *messaging.Gateway
 	SkillsService           *skills.Service
 	ExportService           *exportsvc.Service
+	MCPService              *mcp.Service
+	PluginService           *plugins.Service
+	FeatureService          *features.Service
 	ObservabilityService    *observability.Service
 	Scheduler               *jobs.Scheduler
 	EventService            *runtime.EventService
@@ -804,6 +810,33 @@ func (m *Module) dashboardStatusAPI(e *core.RequestEvent, _ *core.Record) error 
 }
 
 func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error {
+	mcpServers := []any{}
+	if m.options.MCPService != nil {
+		if items, err := m.options.MCPService.ListServers(e.Request.Context(), 50); err == nil {
+			mcpServers = make([]any, 0, len(items))
+			for _, item := range items {
+				mcpServers = append(mcpServers, item)
+			}
+		}
+	}
+	pluginList := []any{}
+	if m.options.PluginService != nil {
+		if items, err := m.options.PluginService.ListPlugins(e.Request.Context(), 50); err == nil {
+			pluginList = make([]any, 0, len(items))
+			for _, item := range items {
+				pluginList = append(pluginList, item)
+			}
+		}
+	}
+	featureContracts := []any{}
+	if m.options.FeatureService != nil {
+		if items, err := m.options.FeatureService.ListContracts(e.Request.Context(), 50); err == nil {
+			featureContracts = make([]any, 0, len(items))
+			for _, item := range items {
+				featureContracts = append(featureContracts, item)
+			}
+		}
+	}
 	return e.JSON(http.StatusOK, map[string]any{
 		"model": map[string]any{
 			"default_provider": m.options.LoadedConfig.Model.DefaultProvider,
@@ -813,13 +846,28 @@ func (m *Module) dashboardConfigAPI(e *core.RequestEvent, _ *core.Record) error 
 			"bind_address": m.options.LoadedConfig.Web.BindAddress,
 			"session_ttl":  m.options.LoadedConfig.Web.SessionTTL,
 		},
+		"media_providers": m.options.LoadedConfig.MediaProviders,
+		"browser_contract": map[string]any{
+			"recording": false,
+			"stealth":   false,
+			"proxies":   false,
+			"keepalive": false,
+			"live_view": false,
+			"reason":    "browser contracts are capability-gated until a backend advertises support",
+		},
 		"approvals": map[string]any{
 			"mode": m.options.LoadedConfig.Approvals.Mode,
 		},
+		"credential_pools":  m.options.LoadedConfig.CredentialPools,
+		"routing":           m.options.LoadedConfig.Routing,
+		"auxiliary_routing": m.options.LoadedConfig.AuxiliaryRouting,
 		"profile": map[string]any{
 			"slug": m.options.Profile.Slug,
 			"root": m.options.Profile.Root,
 		},
+		"mcp_servers":       mcpServers,
+		"plugins":           pluginList,
+		"feature_contracts": featureContracts,
 	})
 }
 
@@ -837,15 +885,29 @@ func (m *Module) dashboardProvidersAPI(e *core.RequestEvent, _ *core.Record) err
 			"model_id":              entry.ModelID,
 			"display_name":          entry.DisplayName,
 			"family":                entry.ProviderFamily,
+			"category":              entry.ProviderCategory,
 			"dialect":               entry.Dialect,
 			"capabilities":          entry.Capabilities,
 			"lifecycle_status":      entry.LifecycleStatus,
 			"credential_configured": credentialConfigured,
 			"credential_env":        authEnv,
+			"credential_pool":       m.options.LoadedConfig.Providers[entry.ProviderID].CredentialPool,
+			"routing_policy":        m.options.LoadedConfig.Routing,
+			"availability_reason":   m.providerAvailabilityReason(entry),
 			"required_headers":      entry.RequiredHeaders,
 		})
 	}
 	return e.JSON(http.StatusOK, map[string]any{"data": items})
+}
+
+func (m *Module) providerAvailabilityReason(entry providers.CatalogEntry) string {
+	if entry.ProviderCategory == "text_generation" {
+		return ""
+	}
+	if _, ok := m.options.LoadedConfig.MediaProviders[entry.ProviderID]; ok {
+		return ""
+	}
+	return "media provider category is declared but no media-specific configuration is loaded"
 }
 
 func (m *Module) dashboardToolsetsAPI(e *core.RequestEvent, _ *core.Record) error {
