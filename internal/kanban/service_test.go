@@ -115,6 +115,7 @@ func TestServiceUpdateTaskPersistsRunLinkageAndQueueState(t *testing.T) {
 	position := 5
 	retryCount := 2
 	startedAt := time.Now().UTC().Round(time.Second)
+	lastError := "transient failure recovered"
 	updated, err := service.UpdateTask(context.Background(), task.ID, UpdateTaskInput{
 		Status:           TaskStatusInProgress,
 		QueueState:       QueueStateRunning,
@@ -124,7 +125,7 @@ func TestServiceUpdateTaskPersistsRunLinkageAndQueueState(t *testing.T) {
 		ParentRunID:      "run_parent_1",
 		LatestRunID:      "run_child_1",
 		DelegationPrompt: "Work through the queue in deterministic order.",
-		LastError:        "transient failure recovered",
+		LastError:        &lastError,
 		RetryCount:       &retryCount,
 		StartedAt:        &startedAt,
 	})

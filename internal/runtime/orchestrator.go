@@ -24,6 +24,7 @@ const (
 type ExecuteRunInput struct {
 	ProfileID        string
 	SessionID        string
+	ParentRunID      string
 	TriggerSource    string
 	UserMessageID    string
 	Surface          string
@@ -77,6 +78,7 @@ func (o *Orchestrator) QueueRun(ctx context.Context, input ExecuteRunInput) (ses
 	run, err := o.sessions.CreateRun(ctx, sessions.CreateRunInput{
 		ProfileID:        input.ProfileID,
 		SessionID:        input.SessionID,
+		ParentRunID:      input.ParentRunID,
 		TriggerSource:    input.TriggerSource,
 		Status:           RunStatusQueued,
 		WorkingDirectory: input.WorkingDirectory,

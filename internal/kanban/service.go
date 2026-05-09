@@ -143,7 +143,7 @@ type UpdateTaskInput struct {
 	ParentRunID      string
 	LatestRunID      string
 	DelegationPrompt string
-	LastError        string
+	LastError        *string
 	RetryCount       *int
 	Metadata         map[string]any
 	DueAt            *time.Time
@@ -393,8 +393,8 @@ func (s *Service) UpdateTask(ctx context.Context, taskID string, input UpdateTas
 	if input.DelegationPrompt != "" {
 		record.Set("delegation_prompt", strings.TrimSpace(input.DelegationPrompt))
 	}
-	if input.LastError != "" {
-		record.Set("last_error", strings.TrimSpace(input.LastError))
+	if input.LastError != nil {
+		record.Set("last_error", strings.TrimSpace(*input.LastError))
 	}
 	if input.RetryCount != nil {
 		record.Set("retry_count", maxInt(*input.RetryCount, 0))
