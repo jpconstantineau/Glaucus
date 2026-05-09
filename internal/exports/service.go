@@ -174,6 +174,8 @@ func (s *Service) writeZipArchive(ctx context.Context, profileID, profileRoot, t
 		"records/messages.json":         "agent_messages",
 		"records/runs.json":             "agent_runs",
 		"records/run_events.json":       "agent_run_events",
+		"records/batch_jobs.json":       "batch_jobs",
+		"records/batch_attempts.json":   "batch_attempts",
 		"records/jobs.json":             "cron_jobs",
 		"records/job_runs.json":         "cron_job_runs",
 		"records/skills.json":           "skills",

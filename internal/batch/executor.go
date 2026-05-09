@@ -3,8 +3,8 @@ package batch
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	"github.com/jpconstantineau/Glaucus/internal/goals"
@@ -289,7 +289,7 @@ func errorString(err error) string {
 }
 
 func itoa(value int) string {
-	return strings.TrimSpace(time.Date(2000, 1, 1, 0, 0, value, 0, time.UTC).Format("05"))
+	return strconv.Itoa(value)
 }
 
 func loadPromptGoals(ctx context.Context, service *goals.Service, profileID, sessionID string) ([]goals.Goal, []goals.Goal, error) {

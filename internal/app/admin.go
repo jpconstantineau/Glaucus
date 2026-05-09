@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	batchsvc "github.com/jpconstantineau/Glaucus/internal/batch"
 	"github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
@@ -81,6 +82,86 @@ func (r *Runtime) CreateProfileExport(ctx context.Context, createdBy string) (ex
 
 func (r *Runtime) ValidateImportPackage(path string) (exports.ValidationResult, error) {
 	return r.exports.ValidateImportPackage(path)
+}
+
+func (r *Runtime) ListBatchJobs(ctx context.Context) ([]batchsvc.Job, error) {
+	if err := r.PrepareStorage(); err != nil {
+		return nil, err
+	}
+	defer r.CloseStorage()
+	return r.batch.ListJobs(ctx, r.profile.Slug, 100)
+}
+
+func (r *Runtime) CreateBatchJob(ctx context.Context, name string, prompts []string) (batchsvc.Job, error) {
+	if err := r.PrepareStorage(); err != nil {
+		return batchsvc.Job{}, err
+	}
+	defer r.CloseStorage()
+
+	items := make([]batchsvc.Item, 0, len(prompts))
+	for index, prompt := range prompts {
+		trimmed := strings.TrimSpace(prompt)
+		if trimmed == "" {
+			continue
+		}
+		items = append(items, batchsvc.Item{
+			Prompt: trimmed,
+			Metadata: map[string]any{
+				"source": "cli",
+				"index":  index + 1,
+			},
+		})
+	}
+	job, _, err := r.batch.CreateJob(ctx, batchsvc.CreateJobInput{
+		ProfileID:        r.profile.Slug,
+		Name:             name,
+		ProviderID:       r.config.Config.Model.DefaultProvider,
+		ModelID:          r.config.Config.Model.DefaultModel,
+		Toolset:          "safe",
+		WorkingDirectory: r.profile.Root,
+		CreatedBy:        "cli",
+		Items:            items,
+		Metadata:         map[string]any{"surface": "cli"},
+	})
+	return job, err
+}
+
+func (r *Runtime) GetBatchJob(ctx context.Context, jobID string) (batchsvc.Job, []batchsvc.Attempt, error) {
+	if err := r.PrepareStorage(); err != nil {
+		return batchsvc.Job{}, nil, err
+	}
+	defer r.CloseStorage()
+
+	job, err := r.batch.GetJob(ctx, jobID)
+	if err != nil {
+		return batchsvc.Job{}, nil, err
+	}
+	attempts, err := r.batch.ListAttempts(ctx, jobID)
+	if err != nil {
+		return batchsvc.Job{}, nil, err
+	}
+	return job, attempts, nil
+}
+
+func (r *Runtime) RunBatchJob(ctx context.Context, jobID string) (batchsvc.ExecutionResult, error) {
+	if err := r.PrepareStorage(); err != nil {
+		return batchsvc.ExecutionResult{}, err
+	}
+	defer r.CloseStorage()
+
+	job, err := r.batch.GetJob(ctx, jobID)
+	if err != nil {
+		return batchsvc.ExecutionResult{}, err
+	}
+	return r.batchExec.ExecuteJob(ctx, r.batch, job)
+}
+
+func (r *Runtime) ExportBatchJob(ctx context.Context, jobID string) (batchsvc.ExportBundle, error) {
+	if err := r.PrepareStorage(); err != nil {
+		return batchsvc.ExportBundle{}, err
+	}
+	defer r.CloseStorage()
+	return r.batch.WriteTrajectoryExport(ctx, jobID, r.profile.Root)
 }
 
 func (r *Runtime) ExecutePrompt(ctx context.Context, text string) (string, error) {

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jpconstantineau/Glaucus/internal/approvals"
+	batchsvc "github.com/jpconstantineau/Glaucus/internal/batch"
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/features"
@@ -55,6 +56,7 @@ type Options struct {
 	Profile                 profile.ActiveProfile
 	ProviderCatalog         providers.Catalog
 	SessionService          *sessions.Service
+	BatchService            *batchsvc.Service
 	GoalService             *goals.Service
 	JobService              *jobs.Service
 	KanbanService           *kanban.Service
@@ -110,6 +112,9 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/dashboard/sessions", m.withOperatorAuth(m.sessionsPage))
 	rg.GET("/dashboard/goals", m.withOperatorAuth(m.goalsPage))
 	rg.GET("/dashboard/runs/{runID}", m.withOperatorAuth(m.runDetailPage))
+	rg.GET("/dashboard/batches", m.withOperatorAuth(m.batchesPage))
+	rg.POST("/dashboard/batches", m.withOperatorAuth(m.batchCreateSubmit))
+	rg.POST("/dashboard/batches/{jobID}/{action}", m.withOperatorAuth(m.batchActionSubmit))
 	rg.GET("/dashboard/jobs", m.withOperatorAuth(m.jobsPage))
 	rg.POST("/dashboard/jobs/{jobID}/{action}", m.withOperatorAuth(m.jobActionSubmit))
 	rg.GET("/dashboard/adapters", m.withOperatorAuth(m.adaptersPage))
@@ -630,6 +635,97 @@ func (m *Module) runDetailPage(e *core.RequestEvent, _ *core.Record) error {
 		Run:     run,
 		Events:  events,
 	}))
+}
+
+func (m *Module) batchesPage(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.BatchService == nil {
+		return e.InternalServerError("batch service unavailable", nil)
+	}
+	csrfToken, err := ensureCSRFCookie(e)
+	if err != nil {
+		return e.InternalServerError("failed to create batch form", err)
+	}
+	jobList, err := m.options.BatchService.ListJobs(e.Request.Context(), m.options.Profile.Slug, 100)
+	if err != nil {
+		jobList = []batchsvc.Job{}
+	}
+	selectedJobID := strings.TrimSpace(e.Request.URL.Query().Get("job"))
+	attempts := []batchsvc.Attempt{}
+	if selectedJobID != "" {
+		attempts, err = m.options.BatchService.ListAttempts(e.Request.Context(), selectedJobID)
+		if err != nil {
+			attempts = []batchsvc.Attempt{}
+		}
+	}
+	return e.HTML(http.StatusOK, batchesTemplate(struct {
+		AppName     string
+		CSRF        string
+		Jobs        []batchsvc.Job
+		SelectedJob string
+		Attempts    []batchsvc.Attempt
+	}{
+		AppName:     m.options.AppName,
+		CSRF:        csrfToken,
+		Jobs:        jobList,
+		SelectedJob: selectedJobID,
+		Attempts:    attempts,
+	}))
+}
+
+func (m *Module) batchCreateSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.BatchService == nil {
+		return e.InternalServerError("batch service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	items := parseBatchPrompts(e.Request.FormValue("prompts"))
+	if len(items) == 0 {
+		return e.BadRequestError("at least one prompt is required", nil)
+	}
+	job, _, err := m.options.BatchService.CreateJob(e.Request.Context(), batchsvc.CreateJobInput{
+		ProfileID:        m.options.Profile.Slug,
+		Name:             firstValue(e.Request.FormValue("name"), "Batch Job"),
+		ProviderID:       m.options.LoadedConfig.Model.DefaultProvider,
+		ModelID:          m.options.LoadedConfig.Model.DefaultModel,
+		Toolset:          firstValue(e.Request.FormValue("toolset"), "safe"),
+		WorkingDirectory: m.options.Profile.Root,
+		CreatedBy:        "dashboard",
+		Items:            items,
+		Metadata:         map[string]any{"surface": "dashboard"},
+	})
+	if err != nil {
+		return e.InternalServerError("failed to create batch job", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/batches?job="+url.QueryEscape(job.ID))
+}
+
+func (m *Module) batchActionSubmit(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.BatchService == nil {
+		return e.InternalServerError("batch service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	jobID := e.Request.PathValue("jobID")
+	switch e.Request.PathValue("action") {
+	case "run":
+		job, err := m.options.BatchService.GetJob(e.Request.Context(), jobID)
+		if err != nil {
+			return e.InternalServerError("failed to load batch job", err)
+		}
+		_, err = m.batchExecutor().ExecuteJob(e.Request.Context(), m.options.BatchService, job)
+		if err != nil {
+			return e.InternalServerError("failed to run batch job", err)
+		}
+	case "export":
+		if _, err := m.options.BatchService.WriteTrajectoryExport(e.Request.Context(), jobID, m.options.Profile.Root); err != nil {
+			return e.InternalServerError("failed to export batch trajectory", err)
+		}
+	default:
+		return e.BadRequestError("unsupported batch action", nil)
+	}
+	return e.Redirect(http.StatusSeeOther, "/dashboard/batches?job="+url.QueryEscape(jobID))
 }
 
 func (m *Module) jobsPage(e *core.RequestEvent, _ *core.Record) error {
@@ -1825,7 +1921,7 @@ var dashboardPageTmpl = template.Must(template.New("dashboard").Parse(`<!doctype
     <section class="panel">
       <h2>Operator Console</h2>
       <p>Open the operator status page at <a href="/dashboard/status">/dashboard/status</a>, the browser chat at <a href="/chat">/chat</a>, and the sessions explorer at <a href="/dashboard/sessions">/dashboard/sessions</a>.</p>
-      <p>Inspect run detail from <a href="/dashboard/runs/">/dashboard/runs/&lt;runID&gt;</a>, cron jobs at <a href="/dashboard/jobs">/dashboard/jobs</a>, messaging adapters at <a href="/dashboard/adapters">/dashboard/adapters</a>, skills at <a href="/dashboard/skills">/dashboard/skills</a>, and logs at <a href="/dashboard/logs">/dashboard/logs</a>.</p>
+      <p>Inspect run detail from <a href="/dashboard/runs/">/dashboard/runs/&lt;runID&gt;</a>, batch jobs at <a href="/dashboard/batches">/dashboard/batches</a>, cron jobs at <a href="/dashboard/jobs">/dashboard/jobs</a>, messaging adapters at <a href="/dashboard/adapters">/dashboard/adapters</a>, skills at <a href="/dashboard/skills">/dashboard/skills</a>, and logs at <a href="/dashboard/logs">/dashboard/logs</a>.</p>
       <p>Review approval requests at <a href="/dashboard/approvals">/dashboard/approvals</a>, inspect effective tool availability at <a href="/dashboard/tools">/dashboard/tools</a>, manage delegated work from <a href="/dashboard/kanban">/dashboard/kanban</a>, and adjust persistent goals at <a href="/dashboard/goals">/dashboard/goals</a>.</p>
       <p>Machine-readable endpoints: <a href="/health">/health</a>, <a href="/health/detailed">/health/detailed</a>, <a href="/api/version">/api/version</a>.</p>
     </section>
@@ -2891,6 +2987,73 @@ var jobsPageTmpl = template.Must(template.New("jobs").Parse(`<!doctype html>
 </body>
 </html>`))
 
+var batchesPageTmpl = template.Must(template.New("batches").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.AppName}} Batch Jobs</title>
+  <style>
+    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
+    .panel { max-width: 78rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
+    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); }
+    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
+    form { display: grid; gap: .65rem; }
+    input, textarea, button { font: inherit; }
+    input, textarea { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; box-sizing: border-box; }
+    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>Batch Jobs</h1>
+    <p><a href="/dashboard">Back to dashboard</a></p>
+    <div class="grid">
+      <form method="post" action="/dashboard/batches">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <h2>Create Batch</h2>
+        <input type="text" name="name" placeholder="Batch name" required>
+        <input type="text" name="toolset" value="safe" placeholder="Toolset">
+        <textarea name="prompts" rows="8" placeholder="One prompt per line" required></textarea>
+        <button type="submit">Create Batch Job</button>
+      </form>
+      <section>
+        <h2>Current Jobs</h2>
+        {{range .Jobs}}
+          <article class="item">
+            <strong>{{.Name}}</strong>
+            <div>Status: {{.Status}} · Items: {{.CompletedCount}}/{{.ItemCount}} completed · Failed: {{.FailedCount}}</div>
+            <div>Model: {{.ModelID}} · Toolset: {{.Toolset}}</div>
+            <div><a href="/dashboard/batches?job={{.ID}}">Inspect attempts</a></div>
+            <form method="post" action="/dashboard/batches/{{.ID}}/run">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <button type="submit">Run / Resume</button>
+            </form>
+            <form method="post" action="/dashboard/batches/{{.ID}}/export">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <button type="submit">Export Trajectory</button>
+            </form>
+          </article>
+        {{else}}
+          <p>No batch jobs yet.</p>
+        {{end}}
+      </section>
+    </div>
+    <h2>Selected Attempt History</h2>
+    {{range .Attempts}}
+      <article class="item">
+        <strong>{{.ItemID}}</strong>
+        <div>Status: {{.Status}} · Run: {{if .RunID}}{{.RunID}}{{else}}not started{{end}}</div>
+        <div>{{.Prompt}}</div>
+        <div>{{if .OutputText}}{{.OutputText}}{{else}}{{.ErrorMessage}}{{end}}</div>
+      </article>
+    {{else}}
+      <p>Select a batch job to inspect attempts.</p>
+    {{end}}
+  </section>
+</body>
+</html>`))
+
 var adaptersPageTmpl = template.Must(template.New("adapters").Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -3035,6 +3198,12 @@ func jobsTemplate(data any) string {
 	return sb.String()
 }
 
+func batchesTemplate(data any) string {
+	var sb strings.Builder
+	_ = batchesPageTmpl.Execute(&sb, data)
+	return sb.String()
+}
+
 func adaptersTemplate(data adaptersPageData) string {
 	var sb strings.Builder
 	_ = adaptersPageTmpl.Execute(&sb, data)
@@ -3075,9 +3244,35 @@ func firstValue(values ...string) string {
 	return ""
 }
 
+func parseBatchPrompts(raw string) []batchsvc.Item {
+	lines := strings.Split(raw, "\n")
+	items := make([]batchsvc.Item, 0, len(lines))
+	for index, line := range lines {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			items = append(items, batchsvc.Item{
+				ID:     fmt.Sprintf("dashboard-%03d", index+1),
+				Prompt: trimmed,
+			})
+		}
+	}
+	return items
+}
+
 func (m *Module) promptGoals(ctx context.Context, sessionID string) ([]goals.Goal, []goals.Goal, error) {
 	if m.options.GoalService == nil {
 		return nil, nil, nil
 	}
 	return m.options.GoalService.ListActiveGoals(ctx, m.options.Profile.Slug, sessionID)
+}
+
+func (m *Module) batchExecutor() batchsvc.RuntimeExecutor {
+	return batchsvc.RuntimeExecutor{
+		Profile:       m.options.Profile,
+		Config:        m.options.LoadedConfig,
+		Sessions:      m.options.SessionService,
+		GoalService:   m.options.GoalService,
+		PromptBuilder: m.options.PromptBuilder,
+		Orchestrator:  m.options.Orchestrator,
+		ToolRegistry:  m.options.ToolRegistry,
+	}
 }

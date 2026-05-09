@@ -57,6 +57,8 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer, opts 
 		return exportCommand(ctx, stdout, opts)
 	case "import":
 		return importCommand(stdout, args[1:], opts)
+	case "batch":
+		return batchCommand(ctx, stdout, args[1:], opts)
 	case "prompt":
 		return promptCommand(ctx, stdout, args[1:], opts)
 	case "acp":
@@ -159,6 +161,76 @@ func importCommand(stdout io.Writer, args []string, opts Options) error {
 	body, _ := json.MarshalIndent(validation, "", "  ")
 	fmt.Fprintln(stdout, string(body))
 	return nil
+}
+
+func batchCommand(ctx context.Context, stdout io.Writer, args []string, opts Options) error {
+	if len(args) == 0 {
+		return errors.New("batch requires a subcommand")
+	}
+	rt, err := newRuntime(opts)
+	if err != nil {
+		return err
+	}
+
+	switch args[0] {
+	case "list":
+		items, err := rt.ListBatchJobs(ctx)
+		if err != nil {
+			return err
+		}
+		body, _ := json.MarshalIndent(items, "", "  ")
+		fmt.Fprintln(stdout, string(body))
+		return nil
+	case "create":
+		if len(args) < 3 {
+			return errors.New("batch create requires a name followed by one or more prompts")
+		}
+		job, err := rt.CreateBatchJob(ctx, args[1], args[2:])
+		if err != nil {
+			return err
+		}
+		body, _ := json.MarshalIndent(job, "", "  ")
+		fmt.Fprintln(stdout, string(body))
+		return nil
+	case "show":
+		if len(args) < 2 {
+			return errors.New("batch show requires a job id")
+		}
+		job, attempts, err := rt.GetBatchJob(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		body, _ := json.MarshalIndent(map[string]any{
+			"job":      job,
+			"attempts": attempts,
+		}, "", "  ")
+		fmt.Fprintln(stdout, string(body))
+		return nil
+	case "run":
+		if len(args) < 2 {
+			return errors.New("batch run requires a job id")
+		}
+		result, err := rt.RunBatchJob(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		body, _ := json.MarshalIndent(result, "", "  ")
+		fmt.Fprintln(stdout, string(body))
+		return nil
+	case "export":
+		if len(args) < 2 {
+			return errors.New("batch export requires a job id")
+		}
+		result, err := rt.ExportBatchJob(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		body, _ := json.MarshalIndent(result, "", "  ")
+		fmt.Fprintln(stdout, string(body))
+		return nil
+	default:
+		return fmt.Errorf("unknown batch subcommand %q", args[0])
+	}
 }
 
 func promptCommand(ctx context.Context, stdout io.Writer, args []string, opts Options) error {
