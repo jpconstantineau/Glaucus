@@ -1,8 +1,10 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -39,11 +41,22 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/tools"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
+	goldhtml "github.com/yuin/goldmark/renderer/html"
 )
 
 const (
 	sessionCookieName = "glaucus_session"
 	csrfCookieName    = "glaucus_csrf"
+)
+
+//go:embed static/*
+var staticAssets embed.FS
+
+var markdownRenderer = goldmark.New(
+	goldmark.WithExtensions(extension.GFM),
+	goldmark.WithRendererOptions(goldhtml.WithHardWraps(), goldhtml.WithXHTML()),
 )
 
 type Options struct {
@@ -84,6 +97,13 @@ type Module struct {
 	options Options
 }
 
+type loginPageData struct {
+	AppName              string
+	CSRF                 string
+	DefaultOperatorEmail string
+	ErrorMessage         string
+}
+
 func Register(app core.App, options Options) *Module {
 	module := &Module{options: options}
 
@@ -104,6 +124,8 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	})
 	rg.GET("/health", m.publicHealth)
 	rg.GET("/metrics", m.metrics)
+	rg.GET("/assets/app.css", m.sharedStylesheet)
+	rg.GET("/favicon.ico", m.favicon)
 	rg.GET("/login", m.loginPage)
 	rg.POST("/login", m.loginSubmit)
 	rg.POST("/logout", m.withOperatorAuth(m.logoutSubmit))
@@ -141,6 +163,9 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/chat", m.withOperatorAuth(m.chatPage))
 	rg.GET("/chat/transcript", m.withOperatorAuth(m.chatTranscript))
 	rg.POST("/chat/send", m.withOperatorAuth(m.chatSend))
+	rg.POST("/chat/sessions/new", m.withOperatorAuth(m.chatSessionNew))
+	rg.POST("/chat/sessions/{sessionID}/archive", m.withOperatorAuth(m.chatSessionArchive))
+	rg.POST("/chat/sessions/{sessionID}/delete", m.withOperatorAuth(m.chatSessionDelete))
 	rg.GET("/health/detailed", m.withOperatorAuth(m.detailedHealth))
 	rg.GET("/api/version", m.withOperatorAuth(m.versionInfo))
 	rg.GET("/api/dashboard/status", m.withOperatorAuth(m.dashboardStatusAPI))
@@ -213,6 +238,34 @@ func (m *Module) metrics(e *core.RequestEvent) error {
 	return err
 }
 
+func (m *Module) sharedStylesheet(e *core.RequestEvent) error {
+	if err := m.requireLocalHost(e); err != nil {
+		return err
+	}
+	data, err := staticAssets.ReadFile("static/app.css")
+	if err != nil {
+		return e.InternalServerError("failed to load stylesheet", err)
+	}
+	applyLocalWebSafetyHeaders(e.Response)
+	e.Response.Header().Set("Content-Type", "text/css; charset=utf-8")
+	_, err = e.Response.Write(data)
+	return err
+}
+
+func (m *Module) favicon(e *core.RequestEvent) error {
+	if err := m.requireLocalHost(e); err != nil {
+		return err
+	}
+	data, err := staticAssets.ReadFile("static/favicon.ico")
+	if err != nil {
+		return e.InternalServerError("failed to load favicon", err)
+	}
+	applyLocalWebSafetyHeaders(e.Response)
+	e.Response.Header().Set("Content-Type", "image/x-icon")
+	_, err = e.Response.Write(data)
+	return err
+}
+
 func (m *Module) loginPage(e *core.RequestEvent) error {
 	if err := m.requireLocalHost(e); err != nil {
 		return err
@@ -223,14 +276,11 @@ func (m *Module) loginPage(e *core.RequestEvent) error {
 		return e.InternalServerError("failed to create login form", err)
 	}
 
-	data := struct {
-		AppName              string
-		CSRF                 string
-		DefaultOperatorEmail string
-	}{
+	data := loginPageData{
 		AppName:              m.options.AppName,
 		CSRF:                 csrfToken,
 		DefaultOperatorEmail: m.options.DefaultOperatorEmail,
+		ErrorMessage:         strings.TrimSpace(e.Request.URL.Query().Get("error")),
 	}
 
 	return e.HTML(http.StatusOK, loginTemplate(data))
@@ -248,12 +298,12 @@ func (m *Module) loginSubmit(e *core.RequestEvent) error {
 	email := strings.TrimSpace(e.Request.FormValue("email"))
 	password := e.Request.FormValue("password")
 	if email == "" || password == "" {
-		return e.BadRequestError("email and password are required", nil)
+		return m.renderLoginError(e, http.StatusBadRequest, "Email and password are required.")
 	}
 
 	record, err := e.App.FindAuthRecordByEmail("operators", email)
 	if err != nil || !record.ValidatePassword(password) {
-		return e.UnauthorizedError("invalid credentials", err)
+		return m.renderLoginError(e, http.StatusUnauthorized, "Invalid credentials.")
 	}
 
 	token, err := record.NewStaticAuthToken(m.options.SessionTTL)
@@ -271,6 +321,20 @@ func (m *Module) loginSubmit(e *core.RequestEvent) error {
 	})
 
 	return e.Redirect(http.StatusSeeOther, "/dashboard")
+}
+
+func (m *Module) renderLoginError(e *core.RequestEvent, status int, message string) error {
+	csrfToken, err := ensureCSRFCookie(e)
+	if err != nil {
+		return e.InternalServerError("failed to create login form", err)
+	}
+
+	return e.HTML(status, loginTemplate(loginPageData{
+		AppName:              m.options.AppName,
+		CSRF:                 csrfToken,
+		DefaultOperatorEmail: m.options.DefaultOperatorEmail,
+		ErrorMessage:         message,
+	}))
 }
 
 func (m *Module) logoutSubmit(e *core.RequestEvent, _ *core.Record) error {
@@ -335,9 +399,10 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 		return e.InternalServerError("failed to list sessions", err)
 	}
 
+	newSessionRequested := e.Request.URL.Query().Get("new") == "1"
 	activeSessionID := strings.TrimSpace(e.Request.URL.Query().Get("session"))
-	if activeSessionID == "" && len(sessionList) > 0 {
-		activeSessionID = sessionList[0].ID
+	if activeSessionID == "" && !newSessionRequested {
+		activeSessionID = defaultSessionID(sessionList)
 	}
 
 	var activeSession *sessions.Session
@@ -367,7 +432,8 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 	}
 
 	runID := strings.TrimSpace(e.Request.URL.Query().Get("run"))
-	selectedToolset := fallbackString(e.Request.URL.Query().Get("toolset"), m.defaultToolset())
+	selectedModel := selectedModelRef(e.Request.URL.Query().Get("model"), activeSession, m.options.LoadedConfig)
+	selectedToolset := selectedToolsetName(e.Request.URL.Query().Get("toolset"), activeSession, m.defaultToolset())
 	data := chatPageData{
 		AppName:         m.options.AppName,
 		OperatorEmail:   operator.Email(),
@@ -376,7 +442,7 @@ func (m *Module) chatPage(e *core.RequestEvent, operator *core.Record) error {
 		ActiveSession:   activeSession,
 		Transcript:      transcript,
 		Models:          m.modelOptions(),
-		SelectedModel:   defaultModelRef(m.options.LoadedConfig),
+		SelectedModel:   selectedModel,
 		Toolsets:        m.toolsetOptions(),
 		SelectedToolset: selectedToolset,
 		ActiveRunID:     runID,
@@ -459,6 +525,22 @@ func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 		if err != nil {
 			return e.InternalServerError("failed to load session", err)
 		}
+		session, err = m.options.SessionService.UpdateSession(e.Request.Context(), session.ID, sessions.UpdateSessionInput{
+			Status: "active",
+			ModelSnapshot: map[string]any{
+				"provider": providerID,
+				"model":    modelID,
+			},
+			ToolsetSnapshot: map[string]any{
+				"name":         fallbackString(toolsetRef, m.defaultToolset()),
+				"surface":      tools.SurfaceWebChat,
+				"tool_names":   toolResolution.ToolNames,
+				"availability": toolResolution.Availability,
+			},
+		})
+		if err != nil {
+			return e.InternalServerError("failed to update session", err)
+		}
 	}
 
 	userMessage, err := m.options.SessionService.CreateMessage(e.Request.Context(), sessions.CreateMessageInput{
@@ -470,6 +552,10 @@ func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 	})
 	if err != nil {
 		return e.InternalServerError("failed to persist user message", err)
+	}
+	messages, err := m.options.SessionService.ListMessages(e.Request.Context(), session.ID)
+	if err != nil {
+		return e.InternalServerError("failed to load session history", err)
 	}
 
 	promptDoc := runtime.PromptDocument{}
@@ -505,7 +591,7 @@ func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 		ToolInvocation: invocation,
 		Prompt:         promptDoc,
 		Request: providers.NormalizedRequest{
-			Messages:     []providers.RequestMessage{{Role: "user", Content: promptText}},
+			Messages:     buildChatMessages(messages),
 			RequiredCaps: []string{"chat"},
 		},
 		Resolution: providers.ResolutionInput{
@@ -523,6 +609,45 @@ func (m *Module) chatSend(e *core.RequestEvent, operator *core.Record) error {
 	go m.processChatRun(run, input)
 
 	return e.Redirect(http.StatusSeeOther, "/chat?session="+url.QueryEscape(session.ID)+"&run="+url.QueryEscape(run.ID))
+}
+
+func (m *Module) chatSessionNew(e *core.RequestEvent, _ *core.Record) error {
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	query := url.Values{}
+	query.Set("new", "1")
+	query.Set("model", strings.TrimSpace(e.Request.FormValue("model")))
+	query.Set("toolset", strings.TrimSpace(e.Request.FormValue("toolset")))
+	return e.Redirect(http.StatusSeeOther, "/chat?"+query.Encode())
+}
+
+func (m *Module) chatSessionArchive(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.SessionService == nil {
+		return e.InternalServerError("session service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	sessionID := e.Request.PathValue("sessionID")
+	if _, err := m.options.SessionService.UpdateSession(e.Request.Context(), sessionID, sessions.UpdateSessionInput{Status: "archived"}); err != nil {
+		return e.InternalServerError("failed to archive session", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/chat?new=1")
+}
+
+func (m *Module) chatSessionDelete(e *core.RequestEvent, _ *core.Record) error {
+	if m.options.SessionService == nil {
+		return e.InternalServerError("session service unavailable", nil)
+	}
+	if err := validateCSRFCookie(e); err != nil {
+		return e.ForbiddenError("invalid csrf token", err)
+	}
+	sessionID := e.Request.PathValue("sessionID")
+	if err := m.options.SessionService.DeleteSession(e.Request.Context(), sessionID); err != nil {
+		return e.InternalServerError("failed to delete session", err)
+	}
+	return e.Redirect(http.StatusSeeOther, "/chat?new=1")
 }
 
 func (m *Module) dashboardStatusPage(e *core.RequestEvent, operator *core.Record) error {
@@ -1833,20 +1958,14 @@ var loginPageTmpl = template.Must(template.New("login").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Login</title>
-  <style>
-    body { font-family: Georgia, serif; background: linear-gradient(135deg, #f3efe4, #dbe7f0); color: #1f2933; margin: 0; }
-    main { max-width: 28rem; margin: 4rem auto; background: rgba(255,255,255,.92); padding: 2rem; border-radius: 1rem; box-shadow: 0 20px 60px rgba(15, 23, 42, .15); }
-    label, input { display: block; width: 100%; }
-    input { margin: .4rem 0 1rem; padding: .8rem; border: 1px solid #c7d2da; border-radius: .6rem; box-sizing: border-box; }
-    button { background: #1f5c4a; color: #fff; border: 0; border-radius: .6rem; padding: .8rem 1rem; width: 100%; }
-    .hint { color: #52606d; font-size: .95rem; }
-  </style>
+  <title>{{.AppName}} Login</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <main>
     <h1>{{.AppName}}</h1>
     <p class="hint">Sign in with the local operator account. Default bootstrap email: <strong>{{.DefaultOperatorEmail}}</strong></p>
+    {{if .ErrorMessage}}<p class="error" role="alert">{{.ErrorMessage}}</p>{{end}}
     <form method="post" action="/login">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <label for="email">Email</label>
@@ -1864,21 +1983,8 @@ var dashboardPageTmpl = template.Must(template.New("dashboard").Parse(`<!doctype
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Dashboard</title>
-  <style>
-    :root { --ink: #102a43; --muted: #627d98; --card: rgba(255,255,255,.88); --accent: #0f766e; --bg-a: #f6efe6; --bg-b: #d9e7ef; }
-    body { margin: 0; font-family: "Trebuchet MS", sans-serif; color: var(--ink); background: radial-gradient(circle at top left, var(--bg-a), var(--bg-b)); }
-    header, main { max-width: 64rem; margin: 0 auto; padding: 1.5rem; }
-    header { display: flex; justify-content: space-between; align-items: center; }
-    .brand { font-size: 1.8rem; font-weight: 700; letter-spacing: .04em; }
-    .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1rem; }
-    .card, .panel { background: var(--card); border-radius: 1rem; padding: 1.25rem; box-shadow: 0 18px 40px rgba(16, 42, 67, .12); }
-    .label { color: var(--muted); text-transform: uppercase; font-size: .78rem; letter-spacing: .08em; }
-    .value { font-size: 1.7rem; margin-top: .4rem; }
-    .panel { margin-top: 1rem; }
-    button { background: var(--accent); color: #fff; border: 0; border-radius: .6rem; padding: .7rem 1rem; }
-    a { color: var(--accent); }
-  </style>
+  <title>{{.AppName}} Dashboard</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <header>
@@ -1934,11 +2040,8 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Glaucus Status</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 42rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-  </style>
+  <title>Glaucus Status</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -1954,43 +2057,15 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!doctype html>
 </body>
 </html>`))
 
-var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
+var chatPageTmpl = template.Must(template.New("chat").Funcs(template.FuncMap{
+	"renderMarkdown": renderMarkdown,
+}).Parse(`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Chat</title>
-  <style>
-    :root { --ink: #1d2733; --muted: #61788a; --paper: rgba(255,255,255,.9); --line: #d6e0e8; --accent: #0d6b5f; --bg-a: #f8ead8; --bg-b: #dceaf0; }
-    body { margin: 0; font-family: "Trebuchet MS", sans-serif; color: var(--ink); background: linear-gradient(145deg, var(--bg-a), var(--bg-b)); }
-    header { display: flex; justify-content: space-between; align-items: center; max-width: 78rem; margin: 0 auto; padding: 1.25rem 1.5rem; }
-    header a { color: var(--accent); text-decoration: none; }
-    main { max-width: 78rem; margin: 0 auto; padding: 0 1.5rem 1.5rem; display: grid; grid-template-columns: 20rem 1fr; gap: 1rem; }
-    .panel { background: var(--paper); border-radius: 1rem; box-shadow: 0 20px 45px rgba(29,39,51,.10); }
-    .sessions { padding: 1rem; }
-    .session-list { display: grid; gap: .6rem; margin-top: 1rem; }
-    .session-item { display: block; padding: .8rem .9rem; border-radius: .8rem; text-decoration: none; color: inherit; background: rgba(13,107,95,.06); }
-    .session-item.active { background: var(--accent); color: white; }
-    .session-title { font-weight: 700; }
-    .session-meta { font-size: .85rem; opacity: .8; margin-top: .25rem; }
-    .chat { padding: 1rem; display: grid; gap: 1rem; }
-    .toolbar { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: .8rem; }
-    .toolbar label { display: grid; gap: .35rem; font-size: .85rem; color: var(--muted); }
-    select, textarea, button { font: inherit; }
-    select, textarea { width: 100%; border: 1px solid var(--line); border-radius: .8rem; padding: .75rem; box-sizing: border-box; background: #fff; }
-    textarea { min-height: 8rem; resize: vertical; }
-    button { border: 0; border-radius: .8rem; background: var(--accent); color: white; padding: .85rem 1.1rem; cursor: pointer; }
-    .transcript, .stream { border: 1px solid var(--line); border-radius: .9rem; background: #fff; padding: 1rem; }
-    .transcript-list { display: grid; gap: .8rem; }
-    .message { border-radius: .9rem; padding: .9rem 1rem; }
-    .message.user { background: #eef6ff; }
-    .message.assistant { background: #f3faf7; }
-    .message .role { font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: .35rem; }
-    .stream pre { white-space: pre-wrap; margin: .75rem 0 0; font-family: Consolas, monospace; }
-    .hint { color: var(--muted); font-size: .92rem; }
-    .empty { color: var(--muted); font-style: italic; }
-    @media (max-width: 860px) { main { grid-template-columns: 1fr; } .toolbar { grid-template-columns: 1fr; } }
-  </style>
+  <title>{{.AppName}} Chat</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <header>
@@ -2003,14 +2078,34 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
   </header>
   <main>
     <aside class="panel sessions">
-      <strong>Sessions</strong>
+      <div class="session-toolbar">
+        <strong>Sessions</strong>
+        <form method="post" action="/chat/sessions/new">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <input type="hidden" name="model" value="{{.SelectedModel}}">
+          <input type="hidden" name="toolset" value="{{.SelectedToolset}}">
+          <button type="submit" class="subtle">New Session</button>
+        </form>
+      </div>
       <div class="session-list">
         {{if .Sessions}}
           {{range .Sessions}}
-            <a class="session-item{{if $.ActiveSession}}{{if eq $.ActiveSession.ID .ID}} active{{end}}{{end}}" href="/chat?session={{.ID}}">
-              <div class="session-title">{{.Title}}</div>
-              <div class="session-meta">{{.Status}} · {{.Source}}</div>
-            </a>
+            <article class="session-item{{if $.ActiveSession}}{{if eq $.ActiveSession.ID .ID}} active{{end}}{{end}}">
+              <a class="session-link" href="/chat?session={{.ID}}">
+                <div class="session-title">{{.Title}}</div>
+                <div class="session-meta">{{.Status}} | {{.Source}}</div>
+              </a>
+              <div class="session-actions">
+                <form method="post" action="/chat/sessions/{{.ID}}/archive">
+                  <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                  <button type="submit" class="subtle">Archive</button>
+                </form>
+                <form method="post" action="/chat/sessions/{{.ID}}/delete" onsubmit="return confirm('Delete this session and its runs?');">
+                  <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                  <button type="submit" class="danger">Delete</button>
+                </form>
+              </div>
+            </article>
           {{end}}
         {{else}}
           <div class="empty">Your first browser prompt will create the first session.</div>
@@ -2021,13 +2116,13 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         {{range .SessionGoals}}
           <div class="session-item">
             <div class="session-title">{{.Title}}</div>
-            <div class="session-meta">Session goal · {{.Status}} · {{.Priority}}</div>
+            <div class="session-meta">Session goal | {{.Status}} | {{.Priority}}</div>
           </div>
         {{end}}
         {{range .ProfileGoals}}
           <div class="session-item">
             <div class="session-title">{{.Title}}</div>
-            <div class="session-meta">Profile goal · {{.Status}} · {{.Priority}}</div>
+            <div class="session-meta">Profile goal | {{.Status}} | {{.Priority}}</div>
           </div>
         {{else}}
           {{if not .SessionGoals}}
@@ -2060,10 +2155,10 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
             </select>
           </label>
         </div>
-        <label style="display:block; margin-top:1rem;">Prompt
+        <label class="prompt-field">Prompt
           <textarea name="prompt" placeholder="Ask Glaucus to summarize a file, inspect the repo, or answer a question..." required></textarea>
         </label>
-        <div style="margin-top:1rem;">
+        <div class="form-actions">
           <button type="submit">Send Prompt</button>
         </div>
       </form>
@@ -2108,6 +2203,9 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         if (payload.payload && payload.payload.text && !live.textContent) {
           live.textContent = payload.payload.text;
         }
+        fetch({{printf "%q" .TranscriptURL}}, { credentials: "same-origin" })
+          .then(function (response) { return response.text(); })
+          .then(function (html) { transcript.innerHTML = html; });
       });
       ["run.completed", "run.failed", "run.cancelled"].forEach(function (name) {
         source.addEventListener(name, function () {
@@ -2127,7 +2225,11 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
       {{range .}}
         <article class="message {{.Role}}">
           <div class="role">{{.Role}}</div>
-          <div>{{.VisibleText}}</div>
+          {{if eq .Role "assistant"}}
+            <div class="markdown">{{renderMarkdown .VisibleText}}</div>
+          {{else}}
+            <div>{{.VisibleText}}</div>
+          {{end}}
         </article>
       {{end}}
     </div>
@@ -2173,11 +2275,21 @@ func goalsTemplate(data goalsPageData) string {
 }
 
 func (m *Module) modelOptions() []modelOption {
-	options := make([]modelOption, 0, len(m.options.ProviderCatalog.Entries))
+	filtered := make([]providers.CatalogEntry, 0, len(m.options.ProviderCatalog.Entries))
 	for _, entry := range m.options.ProviderCatalog.Entries {
+		if m.providerSelectable(entry) {
+			filtered = append(filtered, entry)
+		}
+	}
+	entries := filtered
+	if len(entries) == 0 {
+		entries = m.options.ProviderCatalog.Entries
+	}
+	options := make([]modelOption, 0, len(entries))
+	for _, entry := range entries {
 		options = append(options, modelOption{
 			Ref:   entry.ProviderID + "/" + entry.ModelID,
-			Label: entry.DisplayName + " · " + entry.ProviderID,
+			Label: entry.DisplayName + " | " + entry.ProviderID,
 		})
 	}
 	sort.SliceStable(options, func(i, j int) bool {
@@ -2240,6 +2352,102 @@ func defaultModelRef(cfg config.Config) string {
 		return ""
 	}
 	return cfg.Model.DefaultProvider + "/" + cfg.Model.DefaultModel
+}
+
+func selectedModelRef(queryValue string, session *sessions.Session, cfg config.Config) string {
+	if trimmed := strings.TrimSpace(queryValue); trimmed != "" {
+		return trimmed
+	}
+	if session != nil {
+		if provider, ok := session.ModelSnapshot["provider"].(string); ok && strings.TrimSpace(provider) != "" {
+			if model, ok := session.ModelSnapshot["model"].(string); ok && strings.TrimSpace(model) != "" {
+				return provider + "/" + model
+			}
+		}
+	}
+	return defaultModelRef(cfg)
+}
+
+func selectedToolsetName(queryValue string, session *sessions.Session, fallback string) string {
+	if trimmed := strings.TrimSpace(queryValue); trimmed != "" {
+		return trimmed
+	}
+	if session != nil {
+		if name, ok := session.ToolsetSnapshot["name"].(string); ok && strings.TrimSpace(name) != "" {
+			return name
+		}
+	}
+	return fallback
+}
+
+func defaultSessionID(items []sessions.Session) string {
+	for _, item := range items {
+		if item.Status != "archived" {
+			return item.ID
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	return items[0].ID
+}
+
+func buildChatMessages(items []sessions.Message) []providers.RequestMessage {
+	messages := make([]providers.RequestMessage, 0, len(items))
+	for _, item := range items {
+		if item.Role != "user" && item.Role != "assistant" {
+			continue
+		}
+		text := strings.TrimSpace(item.VisibleText)
+		if text == "" {
+			continue
+		}
+		messages = append(messages, providers.RequestMessage{
+			Role:    item.Role,
+			Content: text,
+		})
+	}
+	return messages
+}
+
+func renderMarkdown(text string) template.HTML {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	var output bytes.Buffer
+	if err := markdownRenderer.Convert([]byte(text), &output); err != nil {
+		return template.HTML("<p>" + template.HTMLEscapeString(text) + "</p>")
+	}
+	return template.HTML(output.String())
+}
+
+func (m *Module) providerSelectable(entry providers.CatalogEntry) bool {
+	if m.providerAvailabilityReason(entry) != "" {
+		return false
+	}
+	if entry.ProviderID != "selfhosted-openai" {
+		return true
+	}
+	return providerProbeOK(entry.BaseURL)
+}
+
+func providerProbeOK(baseURL string) bool {
+	client := http.Client{Timeout: 500 * time.Millisecond}
+	target := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if target == "" {
+		return false
+	}
+	req, err := http.NewRequest(http.MethodGet, target+"/models", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 400
 }
 
 func deriveSessionTitle(prompt string) string {
@@ -2442,16 +2650,8 @@ var approvalsPageTmpl = template.Must(template.New("approvals").Parse(`<!doctype
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Approvals</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 68rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .request { border: 1px solid #d9e2ec; border-radius: .85rem; padding: 1rem; margin-top: 1rem; }
-    .meta { color: #52606d; font-size: .9rem; }
-    form { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .75rem; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-    .deny { background: #b42318; }
-  </style>
+  <title>{{.AppName}} Approvals</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2461,7 +2661,7 @@ var approvalsPageTmpl = template.Must(template.New("approvals").Parse(`<!doctype
       {{range .Requests}}
         <article class="request">
           <strong>{{.ToolName}}</strong>
-          <div class="meta">Decision: {{if .Decision}}{{.Decision}}{{else}}pending{{end}} · Scope: {{if .Scope}}{{.Scope}}{{else}}pending{{end}}</div>
+          <div class="meta">Decision: {{if .Decision}}{{.Decision}}{{else}}pending{{end}} | Scope: {{if .Scope}}{{.Scope}}{{else}}pending{{end}}</div>
           <pre>{{index .Request "summary"}}</pre>
           {{if eq .Decision "pending"}}
             <form method="post" action="/dashboard/approvals/{{.ID}}/decision">
@@ -2486,13 +2686,8 @@ var toolsPageTmpl = template.Must(template.New("tools").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Tools</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 68rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .tool { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-    .meta { color: #52606d; font-size: .9rem; }
-  </style>
+  <title>{{.AppName}} Tools</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2533,24 +2728,8 @@ var kanbanPageTmpl = template.Must(template.New("kanban").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Kanban</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 84rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .board { border: 1px solid #d9e2ec; border-radius: .95rem; padding: 1rem; margin-top: 1rem; }
-    .task { border: 1px solid #bcccdc; border-radius: .85rem; padding: .9rem; margin-top: .9rem; background: #f8fbfc; }
-    .comment { border-left: 3px solid #0f766e; padding-left: .65rem; margin-top: .65rem; color: #334e68; }
-    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); }
-    .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
-    form { display: grid; gap: .65rem; margin-top: .75rem; }
-    input, textarea, select, button { font: inherit; }
-    input, textarea, select { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; box-sizing: border-box; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-    .subtle { background: #486581; }
-    .danger { background: #b42318; }
-    .meta { color: #52606d; font-size: .95rem; }
-    code { background: #eef2f6; padding: .1rem .35rem; border-radius: .4rem; }
-  </style>
+  <title>{{.AppName}} Kanban</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2692,16 +2871,8 @@ var sessionsPageTmpl = template.Must(template.New("sessions").Parse(`<!doctype h
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Sessions</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-    form { display: flex; gap: .5rem; }
-    input, button { font: inherit; }
-    input { flex: 1; padding: .6rem .75rem; border: 1px solid #d9e2ec; border-radius: .6rem; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-  </style>
+  <title>{{.AppName}} Sessions</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2715,8 +2886,8 @@ var sessionsPageTmpl = template.Must(template.New("sessions").Parse(`<!doctype h
     {{range .List}}
       <article class="item">
         <strong>{{.Title}}</strong>
-        <div>Status: {{.Status}} · Source: {{.Source}}</div>
-        <div><a href="/chat?session={{.ID}}">Open chat</a> · <a href="/dashboard/goals?session={{.ID}}">View goals</a></div>
+        <div>Status: {{.Status}} | Source: {{.Source}}</div>
+        <div><a href="/chat?session={{.ID}}">Open chat</a> | <a href="/dashboard/goals?session={{.ID}}">View goals</a></div>
       </article>
     {{else}}
       <p>No sessions yet.</p>
@@ -2740,25 +2911,13 @@ var goalsPageTmpl = template.Must(template.New("goals").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Goals</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 78rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .9rem; margin-top: .85rem; }
-    .meta { color: #52606d; font-size: .95rem; }
-    form { display: grid; gap: .6rem; margin-top: .6rem; }
-    input, textarea, select, button { font: inherit; }
-    input, textarea, select { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; box-sizing: border-box; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-    .subtle { background: #486581; }
-    .danger { background: #b42318; }
-  </style>
+  <title>{{.AppName}} Goals</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
     <h1>Persistent Goals</h1>
-    <p><a href="/dashboard">Back to dashboard</a> · {{if .SelectedSessionID}}<a href="/chat?session={{.SelectedSessionID}}">Open session chat</a>{{end}}</p>
+    <p><a href="/dashboard">Back to dashboard</a> | {{if .SelectedSessionID}}<a href="/chat?session={{.SelectedSessionID}}">Open session chat</a>{{end}}</p>
     <div class="grid">
       <form method="get" action="/dashboard/goals">
         <h2>Session Focus</h2>
@@ -2809,7 +2968,7 @@ var goalsPageTmpl = template.Must(template.New("goals").Parse(`<!doctype html>
         {{range .ProfileGoals}}
           <article class="item">
             <strong>{{.Title}}</strong>
-            <div class="meta">{{.Status}} · {{.Priority}}</div>
+            <div class="meta">{{.Status}} | {{.Priority}}</div>
             <p>{{.Statement}}</p>
             <form method="post" action="/dashboard/goals/profile/{{.ID}}/save">
               <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -2860,7 +3019,7 @@ var goalsPageTmpl = template.Must(template.New("goals").Parse(`<!doctype html>
         {{range .SessionGoals}}
           <article class="item">
             <strong>{{.Title}}</strong>
-            <div class="meta">{{.Status}} · {{.Priority}}</div>
+            <div class="meta">{{.Status}} | {{.Priority}}</div>
             <p>{{.Statement}}</p>
             <form method="post" action="/dashboard/goals/session/{{.ID}}/save">
               <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -2916,13 +3075,8 @@ var runDetailPageTmpl = template.Must(template.New("run-detail").Parse(`<!doctyp
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Run Detail</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .event { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-    pre { white-space: pre-wrap; }
-  </style>
+  <title>{{.AppName}} Run Detail</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2936,7 +3090,7 @@ var runDetailPageTmpl = template.Must(template.New("run-detail").Parse(`<!doctyp
     {{range .Events}}
       <article class="event">
         <strong>{{.Type}}</strong>
-        <div>Sequence {{.Sequence}} · {{.Timestamp}}</div>
+        <div>Sequence {{.Sequence}} | {{.Timestamp}}</div>
         <pre>{{printf "%v" .Payload}}</pre>
       </article>
     {{else}}
@@ -2951,14 +3105,8 @@ var jobsPageTmpl = template.Must(template.New("jobs").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Jobs</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-    form { display: inline-flex; gap: .5rem; margin-top: .5rem; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-  </style>
+  <title>{{.AppName}} Jobs</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2967,7 +3115,7 @@ var jobsPageTmpl = template.Must(template.New("jobs").Parse(`<!doctype html>
     {{range .Jobs}}
       <article class="item">
         <strong>{{.Name}}</strong>
-        <div>{{.ScheduleKind}} · {{.ScheduleValue}} · enabled={{.Enabled}}</div>
+        <div>{{.ScheduleKind}} | {{.ScheduleValue}} | enabled={{.Enabled}}</div>
         <div><a href="/dashboard/jobs?job={{.ID}}">History</a></div>
       </article>
     {{else}}
@@ -2992,17 +3140,8 @@ var batchesPageTmpl = template.Must(template.New("batches").Parse(`<!doctype htm
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Batch Jobs</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 78rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-    form { display: grid; gap: .65rem; }
-    input, textarea, button { font: inherit; }
-    input, textarea { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; box-sizing: border-box; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-  </style>
+  <title>{{.AppName}} Batch Jobs</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -3022,8 +3161,8 @@ var batchesPageTmpl = template.Must(template.New("batches").Parse(`<!doctype htm
         {{range .Jobs}}
           <article class="item">
             <strong>{{.Name}}</strong>
-            <div>Status: {{.Status}} · Items: {{.CompletedCount}}/{{.ItemCount}} completed · Failed: {{.FailedCount}}</div>
-            <div>Model: {{.ModelID}} · Toolset: {{.Toolset}}</div>
+            <div>Status: {{.Status}} | Items: {{.CompletedCount}}/{{.ItemCount}} completed | Failed: {{.FailedCount}}</div>
+            <div>Model: {{.ModelID}} | Toolset: {{.Toolset}}</div>
             <div><a href="/dashboard/batches?job={{.ID}}">Inspect attempts</a></div>
             <form method="post" action="/dashboard/batches/{{.ID}}/run">
               <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -3043,7 +3182,7 @@ var batchesPageTmpl = template.Must(template.New("batches").Parse(`<!doctype htm
     {{range .Attempts}}
       <article class="item">
         <strong>{{.ItemID}}</strong>
-        <div>Status: {{.Status}} · Run: {{if .RunID}}{{.RunID}}{{else}}not started{{end}}</div>
+        <div>Status: {{.Status}} | Run: {{if .RunID}}{{.RunID}}{{else}}not started{{end}}</div>
         <div>{{.Prompt}}</div>
         <div>{{if .OutputText}}{{.OutputText}}{{else}}{{.ErrorMessage}}{{end}}</div>
       </article>
@@ -3059,20 +3198,8 @@ var adaptersPageTmpl = template.Must(template.New("adapters").Parse(`<!doctype h
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Messaging Adapters</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 76rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: 1rem; margin-top: .9rem; }
-    .log { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; background: #f8fbfc; }
-    .meta { color: #52606d; font-size: .95rem; }
-    form { display: grid; gap: .65rem; margin-top: .75rem; }
-    textarea, input, button { font: inherit; }
-    textarea, input[type="text"] { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; }
-    .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-    code { background: #eef2f6; padding: .1rem .35rem; border-radius: .4rem; }
-  </style>
+  <title>{{.AppName}} Messaging Adapters</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -3083,7 +3210,7 @@ var adaptersPageTmpl = template.Must(template.New("adapters").Parse(`<!doctype h
     {{range .Items}}
       <article class="item">
         <strong>{{.Platform}}</strong>
-        <div class="meta">Status: {{.Status}} · Auth: {{if .AuthMode}}{{.AuthMode}}{{else}}unset{{end}} · Enabled: {{.Enabled}} · Last error: {{if .LastError}}{{.LastError}}{{else}}none{{end}}</div>
+        <div class="meta">Status: {{.Status}} | Auth: {{if .AuthMode}}{{.AuthMode}}{{else}}unset{{end}} | Enabled: {{.Enabled}} | Last error: {{if .LastError}}{{.LastError}}{{else}}none{{end}}</div>
         <div class="meta">Allowlist: {{if .Allowlist}}{{range .Allowlist}}{{.}} {{end}}{{else}}none{{end}}</div>
         <form method="post" action="/dashboard/adapters/{{.ID}}/save">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -3110,14 +3237,14 @@ var adaptersPageTmpl = template.Must(template.New("adapters").Parse(`<!doctype h
     {{range .PlatformCatalog}}
       <article class="item">
         <strong>{{.Name}}</strong>
-        <div class="meta">Phase {{.Phase}} · Auth placeholders: {{range .AuthPlaceholders}}{{.}} {{end}}</div>
+        <div class="meta">Phase {{.Phase}} | Auth placeholders: {{range .AuthPlaceholders}}{{.}} {{end}}</div>
       </article>
     {{end}}
     <h2>Recent Logs</h2>
     {{range .Logs}}
       <article class="log">
         <strong>{{.Platform}}</strong>
-        <div class="meta">{{.Direction}} · {{.Status}} · Session {{if .SessionKey}}{{.SessionKey}}{{else}}n/a{{end}}</div>
+        <div class="meta">{{.Direction}} | {{.Status}} | Session {{if .SessionKey}}{{.SessionKey}}{{else}}n/a{{end}}</div>
         <div>{{if .Summary}}{{.Summary}}{{else}}no summary{{end}}</div>
         <div class="meta">{{if .ErrorMessage}}{{.ErrorMessage}}{{else}}no error{{end}}</div>
       </article>
@@ -3133,12 +3260,8 @@ var skillsPageTmpl = template.Must(template.New("skills").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Skills</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-  </style>
+  <title>{{.AppName}} Skills</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -3147,7 +3270,7 @@ var skillsPageTmpl = template.Must(template.New("skills").Parse(`<!doctype html>
     {{range .Skills}}
       <article class="item">
         <strong>{{.Name}}</strong>
-        <div>Slug: {{.Slug}} · State: {{.State}} · Trust: {{.TrustLevel}}</div>
+        <div>Slug: {{.Slug}} | State: {{.State}} | Trust: {{.TrustLevel}}</div>
         <div>Path: {{.RootPath}}/{{.EntryFile}}</div>
       </article>
     {{else}}
@@ -3162,12 +3285,8 @@ var logsPageTmpl = template.Must(template.New("logs").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Logs</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    pre { white-space: pre-wrap; background: #102a43; color: #f0f4f8; padding: 1rem; border-radius: .85rem; }
-  </style>
+  <title>{{.AppName}} Logs</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">

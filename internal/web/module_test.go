@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -156,6 +157,34 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 	mux.ServeHTTP(healthRes, healthReq)
 	if healthRes.Code != http.StatusOK {
 		t.Fatalf("expected 200 from /health, got %d", healthRes.Code)
+	}
+
+	assetReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/assets/app.css", nil)
+	assetReq.Host = "127.0.0.1:8090"
+	assetRes := httptest.NewRecorder()
+	mux.ServeHTTP(assetRes, assetReq)
+	if assetRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 from shared stylesheet, got %d", assetRes.Code)
+	}
+	if contentType := assetRes.Result().Header.Get("Content-Type"); !strings.Contains(contentType, "text/css") {
+		t.Fatalf("expected css content type, got %q", contentType)
+	}
+	if !strings.Contains(assetRes.Body.String(), "--accent") {
+		t.Fatalf("expected shared stylesheet contents, got %s", assetRes.Body.String())
+	}
+
+	faviconReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/favicon.ico", nil)
+	faviconReq.Host = "127.0.0.1:8090"
+	faviconRes := httptest.NewRecorder()
+	mux.ServeHTTP(faviconRes, faviconReq)
+	if faviconRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 from favicon route, got %d", faviconRes.Code)
+	}
+	if contentType := faviconRes.Result().Header.Get("Content-Type"); !strings.Contains(contentType, "image/x-icon") {
+		t.Fatalf("expected favicon content type, got %q", contentType)
+	}
+	if faviconRes.Body.Len() == 0 {
+		t.Fatal("expected favicon bytes")
 	}
 
 	loginPageReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/login", nil)
@@ -417,6 +446,139 @@ func TestLoginPageReusesExistingCSRFCookie(t *testing.T) {
 
 	if len(secondRes.Result().Cookies()) != 0 {
 		t.Fatalf("expected no replacement csrf cookie when one already exists, got %d cookies", len(secondRes.Result().Cookies()))
+	}
+}
+
+func TestLoginFailureRendersLoginPageError(t *testing.T) {
+	app := core.NewBaseApp(core.BaseAppConfig{
+		DataDir:       t.TempDir(),
+		EncryptionEnv: "GLAUCUS_TEST_ENCRYPTION_KEY",
+	})
+	t.Setenv("GLAUCUS_TEST_ENCRYPTION_KEY", "12345678901234567890123456789012")
+	t.Cleanup(func() {
+		_ = app.ResetBootstrapState()
+	})
+
+	if err := app.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap app: %v", err)
+	}
+	if err := app.RunAllMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	if err := EnsureDefaultOperator(app, "admin@glaucus.local", "glaucus-admin"); err != nil {
+		t.Fatalf("ensure operator: %v", err)
+	}
+
+	router, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatalf("new router: %v", err)
+	}
+
+	module := &Module{options: Options{
+		AppName:              "Glaucus",
+		BindAddress:          "127.0.0.1:8090",
+		SessionTTL:           24 * time.Hour,
+		Profile:              profile.ActiveProfile{Slug: "default"},
+		ProviderCatalog:      providers.Catalog{},
+		DefaultOperatorEmail: "admin@glaucus.local",
+	}}
+	module.BindRoutes(app, router)
+
+	mux, err := router.BuildMux()
+	if err != nil {
+		t.Fatalf("build mux: %v", err)
+	}
+
+	loginPageReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/login", nil)
+	loginPageReq.Host = "127.0.0.1:8090"
+	loginPageRes := httptest.NewRecorder()
+	mux.ServeHTTP(loginPageRes, loginPageReq)
+	if loginPageRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /login, got %d", loginPageRes.Code)
+	}
+	if !strings.Contains(loginPageRes.Body.String(), `/assets/app.css`) {
+		t.Fatalf("expected login page to link shared stylesheet, got %s", loginPageRes.Body.String())
+	}
+	if !strings.Contains(loginPageRes.Body.String(), `/favicon.ico`) {
+		t.Fatalf("expected login page to link favicon, got %s", loginPageRes.Body.String())
+	}
+
+	csrfCookie := loginPageRes.Result().Cookies()[0]
+	csrfToken := extractValue(loginPageRes.Body.String(), `name="csrf" value="`, `"`)
+
+	form := url.Values{
+		"csrf":     {csrfToken},
+		"email":    {"admin@glaucus.local"},
+		"password": {"wrong-password"},
+	}
+	loginReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8090/login", strings.NewReader(form.Encode()))
+	loginReq.Host = "127.0.0.1:8090"
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginReq.AddCookie(csrfCookie)
+	loginRes := httptest.NewRecorder()
+	mux.ServeHTTP(loginRes, loginReq)
+
+	if loginRes.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized status, got %d", loginRes.Code)
+	}
+	body := loginRes.Body.String()
+	if !strings.Contains(body, "Invalid credentials.") {
+		t.Fatalf("expected inline login error, got %s", body)
+	}
+	if strings.Contains(body, `{"data":`) {
+		t.Fatalf("expected login page html instead of json error, got %s", body)
+	}
+}
+
+func TestBuildChatMessagesIncludesConversationHistory(t *testing.T) {
+	messages := buildChatMessages([]sessions.Message{
+		{Role: "user", VisibleText: "First question"},
+		{Role: "assistant", VisibleText: "First answer"},
+		{Role: "system", VisibleText: "ignored"},
+		{Role: "user", VisibleText: "Follow-up"},
+	})
+	if len(messages) != 3 {
+		t.Fatalf("expected three chat messages, got %#v", messages)
+	}
+	if messages[0].Content != "First question" || messages[1].Content != "First answer" || messages[2].Content != "Follow-up" {
+		t.Fatalf("unexpected chat history mapping: %#v", messages)
+	}
+}
+
+func TestRenderMarkdownFormatsAssistantTranscript(t *testing.T) {
+	html := string(renderMarkdown("## Title\n\n- one\n- two\n\n**bold**"))
+	if !strings.Contains(html, "<h2>Title</h2>") || !strings.Contains(html, "<strong>bold</strong>") || !strings.Contains(html, "<li>one</li>") {
+		t.Fatalf("expected markdown html output, got %s", html)
+	}
+}
+
+func TestModelOptionsHideUnreachableSelfHostedProvider(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Fatalf("unexpected probe path %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	module := &Module{options: Options{
+		ProviderCatalog: providers.Catalog{Entries: []providers.CatalogEntry{
+			{ProviderID: "selfhosted-openai", ModelID: "offline", DisplayName: "Offline", BaseURL: "http://127.0.0.1:0", ProviderCategory: "text_generation"},
+			{ProviderID: "selfhosted-openai", ModelID: "healthy", DisplayName: "Healthy", BaseURL: server.URL, ProviderCategory: "text_generation"},
+			{ProviderID: "ollama-local", ModelID: "llama3.2:3b", DisplayName: "Local", BaseURL: "http://127.0.0.1:11434/v1", ProviderCategory: "text_generation"},
+		}},
+	}}
+
+	options := module.modelOptions()
+	refs := make([]string, 0, len(options))
+	for _, option := range options {
+		refs = append(refs, option.Ref)
+	}
+	if slices.Contains(refs, "selfhosted-openai/offline") {
+		t.Fatalf("expected unreachable self-hosted provider to be hidden, got %#v", refs)
+	}
+	if !slices.Contains(refs, "selfhosted-openai/healthy") {
+		t.Fatalf("expected reachable self-hosted provider to remain selectable, got %#v", refs)
 	}
 }
 
