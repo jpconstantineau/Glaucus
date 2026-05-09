@@ -172,6 +172,20 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		t.Fatalf("expected shared stylesheet contents, got %s", assetRes.Body.String())
 	}
 
+	faviconReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/favicon.ico", nil)
+	faviconReq.Host = "127.0.0.1:8090"
+	faviconRes := httptest.NewRecorder()
+	mux.ServeHTTP(faviconRes, faviconReq)
+	if faviconRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 from favicon route, got %d", faviconRes.Code)
+	}
+	if contentType := faviconRes.Result().Header.Get("Content-Type"); !strings.Contains(contentType, "image/x-icon") {
+		t.Fatalf("expected favicon content type, got %q", contentType)
+	}
+	if faviconRes.Body.Len() == 0 {
+		t.Fatal("expected favicon bytes")
+	}
+
 	loginPageReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/login", nil)
 	loginPageReq.Host = "127.0.0.1:8090"
 	loginPageRes := httptest.NewRecorder()
@@ -483,6 +497,9 @@ func TestLoginFailureRendersLoginPageError(t *testing.T) {
 	}
 	if !strings.Contains(loginPageRes.Body.String(), `/assets/app.css`) {
 		t.Fatalf("expected login page to link shared stylesheet, got %s", loginPageRes.Body.String())
+	}
+	if !strings.Contains(loginPageRes.Body.String(), `/favicon.ico`) {
+		t.Fatalf("expected login page to link favicon, got %s", loginPageRes.Body.String())
 	}
 
 	csrfCookie := loginPageRes.Result().Cookies()[0]

@@ -116,6 +116,7 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	rg.GET("/health", m.publicHealth)
 	rg.GET("/metrics", m.metrics)
 	rg.GET("/assets/app.css", m.sharedStylesheet)
+	rg.GET("/favicon.ico", m.favicon)
 	rg.GET("/login", m.loginPage)
 	rg.POST("/login", m.loginSubmit)
 	rg.POST("/logout", m.withOperatorAuth(m.logoutSubmit))
@@ -235,6 +236,20 @@ func (m *Module) sharedStylesheet(e *core.RequestEvent) error {
 	}
 	applyLocalWebSafetyHeaders(e.Response)
 	e.Response.Header().Set("Content-Type", "text/css; charset=utf-8")
+	_, err = e.Response.Write(data)
+	return err
+}
+
+func (m *Module) favicon(e *core.RequestEvent) error {
+	if err := m.requireLocalHost(e); err != nil {
+		return err
+	}
+	data, err := staticAssets.ReadFile("static/favicon.ico")
+	if err != nil {
+		return e.InternalServerError("failed to load favicon", err)
+	}
+	applyLocalWebSafetyHeaders(e.Response)
+	e.Response.Header().Set("Content-Type", "image/x-icon")
 	_, err = e.Response.Write(data)
 	return err
 }
@@ -1870,7 +1885,8 @@ var loginPageTmpl = template.Must(template.New("login").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Login</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Login</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <main>
@@ -1894,7 +1910,8 @@ var dashboardPageTmpl = template.Must(template.New("dashboard").Parse(`<!doctype
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Dashboard</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Dashboard</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <header>
@@ -1950,7 +1967,8 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Glaucus Status</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>Glaucus Status</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -1971,7 +1989,8 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Chat</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Chat</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <header>
@@ -2423,7 +2442,8 @@ var approvalsPageTmpl = template.Must(template.New("approvals").Parse(`<!doctype
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Approvals</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Approvals</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2458,7 +2478,8 @@ var toolsPageTmpl = template.Must(template.New("tools").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Tools</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Tools</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2499,7 +2520,8 @@ var kanbanPageTmpl = template.Must(template.New("kanban").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Kanban</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Kanban</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2641,7 +2663,8 @@ var sessionsPageTmpl = template.Must(template.New("sessions").Parse(`<!doctype h
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Sessions</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Sessions</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2680,7 +2703,8 @@ var goalsPageTmpl = template.Must(template.New("goals").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Goals</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Goals</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2843,7 +2867,8 @@ var runDetailPageTmpl = template.Must(template.New("run-detail").Parse(`<!doctyp
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Run Detail</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Run Detail</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2872,7 +2897,8 @@ var jobsPageTmpl = template.Must(template.New("jobs").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Jobs</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Jobs</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2906,7 +2932,8 @@ var batchesPageTmpl = template.Must(template.New("batches").Parse(`<!doctype htm
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Batch Jobs</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Batch Jobs</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2963,7 +2990,8 @@ var adaptersPageTmpl = template.Must(template.New("adapters").Parse(`<!doctype h
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Messaging Adapters</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Messaging Adapters</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -3024,7 +3052,8 @@ var skillsPageTmpl = template.Must(template.New("skills").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Skills</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Skills</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -3048,7 +3077,8 @@ var logsPageTmpl = template.Must(template.New("logs").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Logs</title>  <link rel="stylesheet" href="/assets/app.css">
+  <title>{{.AppName}} Logs</title>  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
