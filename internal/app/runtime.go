@@ -12,6 +12,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/features"
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/hooks"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/kanban"
@@ -60,6 +61,7 @@ type Runtime struct {
 	mcp        *mcp.Service
 	plugins    *plugins.Service
 	features   *features.Service
+	goals      *goals.Service
 	curator    *skills.Curator
 	metrics    *observability.Service
 	scheduler  *jobs.Scheduler
@@ -153,7 +155,8 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	tools.RegisterWebTools(runtime.tools, tools.NewHTTPWebBackend(), nil)
 	tools.RegisterMessagingTools(runtime.tools, runtime.messaging)
 	tools.RegisterJobTools(runtime.tools, jobToolAdapter{service: runtime.jobs})
-	tools.RegisterPlanningTools(runtime.tools, todoToolAdapter{service: runtime.sessions}, memoryToolAdapter{service: runtime.memory, profileRoot: activeProfile.Root}, searchToolAdapter{service: runtime.search})
+	runtime.goals = goals.NewService(pb)
+	tools.RegisterPlanningTools(runtime.tools, todoToolAdapter{service: runtime.sessions}, memoryToolAdapter{service: runtime.memory, profileRoot: activeProfile.Root}, searchToolAdapter{service: runtime.search}, goalToolAdapter{service: runtime.goals})
 	tools.RegisterSkillsTools(runtime.tools, skillsToolAdapter{service: runtime.skills, profileRoot: activeProfile.Root})
 	runtime.mcp = mcp.NewService(pb)
 	runtime.plugins = plugins.NewService(pb)
@@ -209,6 +212,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		Orchestrator:            runtime.runs,
 		ApprovalService:         approvalService,
 		ToolRegistry:            runtime.tools,
+		GoalService:             runtime.goals,
 		LoadedConfig:            loadedConfig.Config,
 		DefaultOperatorEmail:    "admin@glaucus.local",
 		DefaultOperatorPassword: "glaucus-admin",
@@ -219,6 +223,7 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 		ProviderCatalog: catalog,
 		Router:          runtime.router,
 		SessionService:  runtime.sessions,
+		GoalService:     runtime.goals,
 		JobService:      runtime.jobs,
 		EventService:    runtime.events,
 		PromptBuilder:   runtime.prompts,

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
 	"github.com/jpconstantineau/Glaucus/internal/providers"
@@ -28,6 +29,7 @@ type Options struct {
 	ProviderCatalog providers.Catalog
 	Router          *providers.Router
 	SessionService  *sessions.Service
+	GoalService     *goals.Service
 	JobService      *jobs.Service
 	EventService    *runtime.EventService
 	PromptBuilder   *runtime.PromptBuilder
@@ -65,6 +67,12 @@ func (m *Module) BindRoutes(rg *router.Router[*core.RequestEvent]) {
 	rg.POST("/v1/jobs/{jobID}/resume", m.withBearerAuth(m.jobsResume))
 	rg.POST("/v1/jobs/{jobID}/run", m.withBearerAuth(m.jobsRun))
 	rg.DELETE("/v1/jobs/{jobID}", m.withBearerAuth(m.jobsDelete))
+	rg.GET("/v1/goals", m.withBearerAuth(m.goalsList))
+	rg.POST("/v1/goals", m.withBearerAuth(m.goalsCreate))
+	rg.GET("/v1/goals/{scope}/{goalID}", m.withBearerAuth(m.goalsGet))
+	rg.PATCH("/v1/goals/{scope}/{goalID}", m.withBearerAuth(m.goalsPatch))
+	rg.POST("/v1/goals/{scope}/{goalID}/clear", m.withBearerAuth(m.goalsClear))
+	rg.POST("/v1/goals/{scope}/{goalID}/evaluate", m.withBearerAuth(m.goalsEvaluate))
 	rg.GET("/v1/models", m.withBearerAuth(m.modelsList))
 	rg.GET("/v1/capabilities", m.withBearerAuth(m.capabilitiesGet))
 }
@@ -400,6 +408,20 @@ type jobsRequest struct {
 	ProviderOverrides map[string]any `json:"provider_overrides"`
 }
 
+type goalsRequest struct {
+	Scope           string         `json:"scope"`
+	SessionID       string         `json:"session_id"`
+	Title           string         `json:"title"`
+	Statement       string         `json:"statement"`
+	SuccessCriteria string         `json:"success_criteria"`
+	Status          string         `json:"status"`
+	Priority        string         `json:"priority"`
+	Tags            []string       `json:"tags"`
+	State           map[string]any `json:"state"`
+	Metadata        map[string]any `json:"metadata"`
+	Evaluation      map[string]any `json:"evaluation"`
+}
+
 func (m *Module) jobsList(e *core.RequestEvent) error {
 	if m.options.JobService == nil {
 		return m.writeError(e, http.StatusServiceUnavailable, "job service unavailable")
@@ -564,6 +586,114 @@ func (m *Module) jobsDelete(e *core.RequestEvent) error {
 	return e.JSON(http.StatusOK, map[string]any{"id": jobID, "deleted": true})
 }
 
+func (m *Module) goalsList(e *core.RequestEvent) error {
+	if m.options.GoalService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "goal service unavailable")
+	}
+	items, err := m.options.GoalService.ListGoals(e.Request.Context(), goals.ListGoalsInput{
+		Scope:     e.Request.URL.Query().Get("scope"),
+		ProfileID: m.options.Profile.Slug,
+		SessionID: e.Request.URL.Query().Get("session_id"),
+		Status:    e.Request.URL.Query().Get("status"),
+		Limit:     parseInt(e.Request.URL.Query().Get("limit"), 50),
+	})
+	if err != nil {
+		return m.writeError(e, http.StatusBadRequest, err.Error())
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": items})
+}
+
+func (m *Module) goalsCreate(e *core.RequestEvent) error {
+	if m.options.GoalService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "goal service unavailable")
+	}
+	var req goalsRequest
+	if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
+		return m.writeError(e, http.StatusBadRequest, "invalid request body")
+	}
+	goal, err := m.options.GoalService.CreateGoal(e.Request.Context(), goals.CreateGoalInput{
+		Scope:           req.Scope,
+		ProfileID:       m.options.Profile.Slug,
+		SessionID:       req.SessionID,
+		Title:           req.Title,
+		Statement:       req.Statement,
+		SuccessCriteria: req.SuccessCriteria,
+		Status:          req.Status,
+		Priority:        req.Priority,
+		Tags:            req.Tags,
+		State:           req.State,
+		Metadata:        req.Metadata,
+	})
+	if err != nil {
+		return m.writeError(e, http.StatusBadRequest, err.Error())
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": goal})
+}
+
+func (m *Module) goalsGet(e *core.RequestEvent) error {
+	if m.options.GoalService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "goal service unavailable")
+	}
+	goal, err := m.options.GoalService.GetGoal(e.Request.Context(), e.Request.PathValue("scope"), e.Request.PathValue("goalID"))
+	if err != nil {
+		return m.writeError(e, http.StatusNotFound, "goal not found")
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": goal})
+}
+
+func (m *Module) goalsPatch(e *core.RequestEvent) error {
+	if m.options.GoalService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "goal service unavailable")
+	}
+	var req goalsRequest
+	if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
+		return m.writeError(e, http.StatusBadRequest, "invalid request body")
+	}
+	goal, err := m.options.GoalService.UpdateGoal(e.Request.Context(), e.Request.PathValue("scope"), e.Request.PathValue("goalID"), goals.UpdateGoalInput{
+		Title:           req.Title,
+		Statement:       req.Statement,
+		SuccessCriteria: req.SuccessCriteria,
+		Status:          req.Status,
+		Priority:        req.Priority,
+		Tags:            req.Tags,
+		State:           req.State,
+		Metadata:        req.Metadata,
+	})
+	if err != nil {
+		return m.writeError(e, http.StatusBadRequest, err.Error())
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": goal})
+}
+
+func (m *Module) goalsClear(e *core.RequestEvent) error {
+	if m.options.GoalService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "goal service unavailable")
+	}
+	goal, err := m.options.GoalService.ClearGoal(e.Request.Context(), e.Request.PathValue("scope"), e.Request.PathValue("goalID"), goals.ClearGoalInput{})
+	if err != nil {
+		return m.writeError(e, http.StatusBadRequest, err.Error())
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": goal})
+}
+
+func (m *Module) goalsEvaluate(e *core.RequestEvent) error {
+	if m.options.GoalService == nil {
+		return m.writeError(e, http.StatusServiceUnavailable, "goal service unavailable")
+	}
+	var req goalsRequest
+	if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
+		return m.writeError(e, http.StatusBadRequest, "invalid request body")
+	}
+	goal, err := m.options.GoalService.EvaluateGoal(e.Request.Context(), e.Request.PathValue("scope"), e.Request.PathValue("goalID"), goals.EvaluateGoalInput{
+		Evaluation: req.Evaluation,
+		Status:     req.Status,
+	})
+	if err != nil {
+		return m.writeError(e, http.StatusBadRequest, err.Error())
+	}
+	return e.JSON(http.StatusOK, map[string]any{"data": goal})
+}
+
 func (m *Module) modelsList(e *core.RequestEvent) error {
 	data := make([]map[string]any, 0, len(m.options.ProviderCatalog.Entries))
 	for _, entry := range m.options.ProviderCatalog.Entries {
@@ -594,6 +724,7 @@ func (m *Module) capabilitiesGet(e *core.RequestEvent) error {
 			"run.events",
 			"run.stop",
 			"jobs",
+			"goals",
 			"models.list",
 		},
 	})
@@ -844,4 +975,12 @@ func errorString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func parseInt(raw string, fallback int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
 }

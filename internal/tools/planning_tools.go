@@ -21,6 +21,15 @@ type SessionSearchManager interface {
 	SearchSessions(context.Context, string, string, int) (any, error)
 }
 
+type GoalManager interface {
+	ListGoals(context.Context, GoalListInput) (any, error)
+	GetGoal(context.Context, string, string) (any, error)
+	CreateGoal(context.Context, GoalCreateInput) (any, error)
+	UpdateGoal(context.Context, string, string, GoalUpdateInput) (any, error)
+	ClearGoal(context.Context, string, string, GoalClearInput) (any, error)
+	EvaluateGoal(context.Context, string, string, GoalEvaluateInput) (any, error)
+}
+
 type MemoryWriteInput struct {
 	ProfileID    string
 	ProfileRoot  string
@@ -30,7 +39,53 @@ type MemoryWriteInput struct {
 	Content      string
 }
 
-func RegisterPlanningTools(registry *Registry, todo TodoManager, memory MemoryManager, search SessionSearchManager) {
+type GoalListInput struct {
+	Scope     string
+	ProfileID string
+	SessionID string
+	Status    string
+	Limit     int
+}
+
+type GoalCreateInput struct {
+	Scope           string
+	ProfileID       string
+	SessionID       string
+	Title           string
+	Statement       string
+	SuccessCriteria string
+	Status          string
+	Priority        string
+	Tags            []string
+	State           map[string]any
+	Metadata        map[string]any
+	CreatedByRunID  string
+}
+
+type GoalUpdateInput struct {
+	Title           string
+	Statement       string
+	SuccessCriteria string
+	Status          string
+	Priority        string
+	Tags            []string
+	State           map[string]any
+	Metadata        map[string]any
+	UpdatedByRunID  string
+}
+
+type GoalClearInput struct {
+	ClearedByRunID string
+}
+
+type GoalEvaluateInput struct {
+	Evaluation       map[string]any
+	Status           string
+	UpdatedByRunID   string
+	EvaluatedByRunID string
+}
+
+func RegisterPlanningTools(registry *Registry, todo TodoManager, memory MemoryManager, search SessionSearchManager, goals GoalManager) {
 	if registry == nil {
 		return
 	}
@@ -42,6 +97,9 @@ func RegisterPlanningTools(registry *Registry, todo TodoManager, memory MemoryMa
 	}
 	if search != nil {
 		registry.Register(SessionSearchTool{manager: search})
+	}
+	if goals != nil {
+		registry.Register(GoalTool{manager: goals})
 	}
 }
 
@@ -258,6 +316,153 @@ func todoItemsArg(args map[string]any, key string) []map[string]any {
 			continue
 		}
 		items = append(items, item)
+	}
+	return items
+}
+
+type GoalTool struct {
+	manager GoalManager
+}
+
+func (t GoalTool) Definition() ToolDefinition {
+	return ToolDefinition{
+		Name:        "goal",
+		Description: "Create, inspect, update, clear, and evaluate durable session or profile goals.",
+		JSONSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action":           map[string]any{"type": "string"},
+				"scope":            map[string]any{"type": "string"},
+				"goal_id":          map[string]any{"type": "string"},
+				"session_id":       map[string]any{"type": "string"},
+				"title":            map[string]any{"type": "string"},
+				"statement":        map[string]any{"type": "string"},
+				"success_criteria": map[string]any{"type": "string"},
+				"status":           map[string]any{"type": "string"},
+				"priority":         map[string]any{"type": "string"},
+				"tags":             map[string]any{"type": "array"},
+				"state":            map[string]any{"type": "object"},
+				"metadata":         map[string]any{"type": "object"},
+				"evaluation":       map[string]any{"type": "object"},
+				"limit":            map[string]any{"type": "integer"},
+			},
+			"required": []string{"action", "scope"},
+		},
+		Toolsets:     []string{"todo"},
+		Concurrency:  "single-flight",
+		DisplayGroup: "planning",
+	}
+}
+
+func (t GoalTool) CheckAvailability(ctx context.Context, req AvailabilityRequest) AvailabilityResult {
+	_ = ctx
+	_ = req
+	if t.manager == nil {
+		return AvailabilityResult{Available: false, Reason: "goal manager is unavailable"}
+	}
+	return AvailabilityResult{Available: true}
+}
+
+func (t GoalTool) Execute(ctx context.Context, req ToolRequest) ToolResult {
+	if t.manager == nil {
+		return ToolResult{Status: StatusFatalError, DisplayText: "goal manager is unavailable"}
+	}
+
+	scope := stringArg(req.Arguments, "scope")
+	action := strings.ToLower(stringArg(req.Arguments, "action"))
+	switch action {
+	case "list":
+		items, err := t.manager.ListGoals(ctx, GoalListInput{
+			Scope:     scope,
+			ProfileID: req.ProfileID,
+			SessionID: fallbackString(stringArg(req.Arguments, "session_id"), req.SessionID),
+			Status:    stringArg(req.Arguments, "status"),
+			Limit:     intArg(req.Arguments, "limit", 20),
+		})
+		if err != nil {
+			return ToolResult{Status: StatusValidationError, DisplayText: err.Error()}
+		}
+		return ToolResult{Status: StatusSuccess, Payload: map[string]any{"goals": items}, DisplayText: fmt.Sprintf("Loaded %d goals.", sliceLen(items))}
+	case "view":
+		goal, err := t.manager.GetGoal(ctx, scope, stringArg(req.Arguments, "goal_id"))
+		if err != nil {
+			return ToolResult{Status: StatusFatalError, DisplayText: err.Error()}
+		}
+		return ToolResult{Status: StatusSuccess, Payload: map[string]any{"goal": goal}, DisplayText: "Loaded goal."}
+	case "create":
+		goal, err := t.manager.CreateGoal(ctx, GoalCreateInput{
+			Scope:           scope,
+			ProfileID:       req.ProfileID,
+			SessionID:       fallbackString(stringArg(req.Arguments, "session_id"), req.SessionID),
+			Title:           stringArg(req.Arguments, "title"),
+			Statement:       stringArg(req.Arguments, "statement"),
+			SuccessCriteria: stringArg(req.Arguments, "success_criteria"),
+			Status:          stringArg(req.Arguments, "status"),
+			Priority:        stringArg(req.Arguments, "priority"),
+			Tags:            stringSliceArg(req.Arguments, "tags"),
+			State:           mapArg(req.Arguments, "state"),
+			Metadata:        mapArg(req.Arguments, "metadata"),
+			CreatedByRunID:  req.RunID,
+		})
+		if err != nil {
+			return ToolResult{Status: StatusValidationError, DisplayText: err.Error()}
+		}
+		return ToolResult{Status: StatusSuccess, Payload: map[string]any{"goal": goal}, DisplayText: "Created goal."}
+	case "update":
+		goal, err := t.manager.UpdateGoal(ctx, scope, stringArg(req.Arguments, "goal_id"), GoalUpdateInput{
+			Title:           stringArg(req.Arguments, "title"),
+			Statement:       stringArg(req.Arguments, "statement"),
+			SuccessCriteria: stringArg(req.Arguments, "success_criteria"),
+			Status:          stringArg(req.Arguments, "status"),
+			Priority:        stringArg(req.Arguments, "priority"),
+			Tags:            stringSliceArg(req.Arguments, "tags"),
+			State:           mapArg(req.Arguments, "state"),
+			Metadata:        mapArg(req.Arguments, "metadata"),
+			UpdatedByRunID:  req.RunID,
+		})
+		if err != nil {
+			return ToolResult{Status: StatusValidationError, DisplayText: err.Error()}
+		}
+		return ToolResult{Status: StatusSuccess, Payload: map[string]any{"goal": goal}, DisplayText: "Updated goal."}
+	case "clear":
+		goal, err := t.manager.ClearGoal(ctx, scope, stringArg(req.Arguments, "goal_id"), GoalClearInput{ClearedByRunID: req.RunID})
+		if err != nil {
+			return ToolResult{Status: StatusFatalError, DisplayText: err.Error()}
+		}
+		return ToolResult{Status: StatusSuccess, Payload: map[string]any{"goal": goal}, DisplayText: "Cleared goal."}
+	case "evaluate":
+		goal, err := t.manager.EvaluateGoal(ctx, scope, stringArg(req.Arguments, "goal_id"), GoalEvaluateInput{
+			Evaluation:       mapArg(req.Arguments, "evaluation"),
+			Status:           stringArg(req.Arguments, "status"),
+			UpdatedByRunID:   req.RunID,
+			EvaluatedByRunID: req.RunID,
+		})
+		if err != nil {
+			return ToolResult{Status: StatusValidationError, DisplayText: err.Error()}
+		}
+		return ToolResult{Status: StatusSuccess, Payload: map[string]any{"goal": goal}, DisplayText: "Recorded goal evaluation."}
+	default:
+		return ToolResult{Status: StatusValidationError, DisplayText: fmt.Sprintf("unsupported action %q", action)}
+	}
+}
+
+func stringSliceArg(args map[string]any, key string) []string {
+	if args == nil {
+		return nil
+	}
+	raw, ok := args[key].([]any)
+	if !ok {
+		return nil
+	}
+	items := make([]string, 0, len(raw))
+	for _, value := range raw {
+		text, ok := value.(string)
+		if !ok {
+			continue
+		}
+		if trimmed := strings.TrimSpace(text); trimmed != "" {
+			items = append(items, trimmed)
+		}
 	}
 	return items
 }

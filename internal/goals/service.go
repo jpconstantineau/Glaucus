@@ -73,6 +73,29 @@ type ListGoalsInput struct {
 	Limit     int
 }
 
+type UpdateGoalInput struct {
+	Title           string
+	Statement       string
+	SuccessCriteria string
+	Status          string
+	Priority        string
+	Tags            []string
+	State           map[string]any
+	Metadata        map[string]any
+	UpdatedByRunID  string
+}
+
+type ClearGoalInput struct {
+	ClearedByRunID string
+}
+
+type EvaluateGoalInput struct {
+	Evaluation       map[string]any
+	Status           string
+	UpdatedByRunID   string
+	EvaluatedByRunID string
+}
+
 type Service struct {
 	app core.App
 }
@@ -193,6 +216,127 @@ func (s *Service) ListGoals(ctx context.Context, input ListGoalsInput) ([]Goal, 
 	return items, nil
 }
 
+func (s *Service) UpdateGoal(ctx context.Context, scope, goalID string, input UpdateGoalInput) (Goal, error) {
+	collection, normalizedScope, err := collectionForScope(scope)
+	if err != nil {
+		return Goal{}, err
+	}
+	record, err := s.app.FindRecordById(collection, goalID)
+	if err != nil {
+		return Goal{}, fmt.Errorf("find goal: %w", err)
+	}
+
+	if value := strings.TrimSpace(input.Title); value != "" {
+		record.Set("title", value)
+	}
+	if value := strings.TrimSpace(input.Statement); value != "" {
+		record.Set("statement", value)
+	}
+	if input.SuccessCriteria != "" {
+		record.Set("success_criteria", strings.TrimSpace(input.SuccessCriteria))
+	}
+	if value := strings.TrimSpace(input.Status); value != "" {
+		record.Set("status", value)
+	}
+	if value := strings.TrimSpace(input.Priority); value != "" {
+		record.Set("priority", value)
+	}
+	if input.Tags != nil {
+		if err := setJSON(record, "tags_json", input.Tags); err != nil {
+			return Goal{}, err
+		}
+	}
+	if input.State != nil {
+		if err := setJSON(record, "state_json", input.State); err != nil {
+			return Goal{}, err
+		}
+	}
+	if input.Metadata != nil {
+		if err := setJSON(record, "metadata_json", input.Metadata); err != nil {
+			return Goal{}, err
+		}
+	}
+	if value := strings.TrimSpace(input.UpdatedByRunID); value != "" {
+		record.Set("updated_by_run_id", value)
+	}
+	record.Set("version", record.GetInt("version")+1)
+
+	if err := s.app.SaveWithContext(ctx, record); err != nil {
+		return Goal{}, fmt.Errorf("update goal: %w", err)
+	}
+	return goalFromRecord(normalizedScope, record)
+}
+
+func (s *Service) ClearGoal(ctx context.Context, scope, goalID string, input ClearGoalInput) (Goal, error) {
+	collection, normalizedScope, err := collectionForScope(scope)
+	if err != nil {
+		return Goal{}, err
+	}
+	record, err := s.app.FindRecordById(collection, goalID)
+	if err != nil {
+		return Goal{}, fmt.Errorf("find goal: %w", err)
+	}
+	record.Set("status", StatusCleared)
+	record.Set("cleared_by_run_id", strings.TrimSpace(input.ClearedByRunID))
+	record.Set("updated_by_run_id", strings.TrimSpace(input.ClearedByRunID))
+	record.Set("version", record.GetInt("version")+1)
+	if err := setTime(record, "cleared_at", time.Now().UTC()); err != nil {
+		return Goal{}, err
+	}
+	if err := s.app.SaveWithContext(ctx, record); err != nil {
+		return Goal{}, fmt.Errorf("clear goal: %w", err)
+	}
+	return goalFromRecord(normalizedScope, record)
+}
+
+func (s *Service) EvaluateGoal(ctx context.Context, scope, goalID string, input EvaluateGoalInput) (Goal, error) {
+	collection, normalizedScope, err := collectionForScope(scope)
+	if err != nil {
+		return Goal{}, err
+	}
+	record, err := s.app.FindRecordById(collection, goalID)
+	if err != nil {
+		return Goal{}, fmt.Errorf("find goal: %w", err)
+	}
+
+	evaluation := cloneMap(input.Evaluation)
+	if evaluation == nil {
+		evaluation = map[string]any{}
+	}
+	now := time.Now().UTC()
+	evaluation["evaluated_at"] = now.Format(time.RFC3339Nano)
+	if runID := strings.TrimSpace(input.EvaluatedByRunID); runID != "" {
+		evaluation["run_id"] = runID
+		record.Set("last_evaluated_run_id", runID)
+	}
+
+	history := []map[string]any{}
+	if err := decodeJSONField(record, "evaluation_history_json", &history); err != nil {
+		return Goal{}, err
+	}
+	history = append(history, evaluation)
+	if err := setJSON(record, "last_evaluation_json", evaluation); err != nil {
+		return Goal{}, err
+	}
+	if err := setJSON(record, "evaluation_history_json", history); err != nil {
+		return Goal{}, err
+	}
+	if value := strings.TrimSpace(input.Status); value != "" {
+		record.Set("status", value)
+	}
+	if value := strings.TrimSpace(input.UpdatedByRunID); value != "" {
+		record.Set("updated_by_run_id", value)
+	}
+	record.Set("version", record.GetInt("version")+1)
+	if err := setTime(record, "last_evaluated_at", now); err != nil {
+		return Goal{}, err
+	}
+	if err := s.app.SaveWithContext(ctx, record); err != nil {
+		return Goal{}, fmt.Errorf("evaluate goal: %w", err)
+	}
+	return goalFromRecord(normalizedScope, record)
+}
+
 func (s *Service) newRecord(collection string) (*core.Record, error) {
 	col, err := s.app.FindCollectionByNameOrId(collection)
 	if err != nil {
@@ -274,6 +418,17 @@ func decodeJSONField(record *core.Record, field string, target any) error {
 		return fmt.Errorf("decode %s: %w", field, err)
 	}
 	return nil
+}
+
+func cloneMap(input map[string]any) map[string]any {
+	if input == nil {
+		return nil
+	}
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
 }
 
 func setTime(record *core.Record, field string, value time.Time) error {

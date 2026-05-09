@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/memory"
 	"github.com/jpconstantineau/Glaucus/internal/search"
 	"github.com/jpconstantineau/Glaucus/internal/sessions"
@@ -67,4 +68,66 @@ type searchToolAdapter struct {
 
 func (a searchToolAdapter) SearchSessions(ctx context.Context, profileID, query string, limit int) (any, error) {
 	return a.service.SearchSessions(ctx, profileID, query, limit)
+}
+
+type goalToolAdapter struct {
+	service *goals.Service
+}
+
+func (a goalToolAdapter) ListGoals(ctx context.Context, input tools.GoalListInput) (any, error) {
+	return a.service.ListGoals(ctx, goals.ListGoalsInput{
+		Scope:     input.Scope,
+		ProfileID: input.ProfileID,
+		SessionID: input.SessionID,
+		Status:    input.Status,
+		Limit:     input.Limit,
+	})
+}
+
+func (a goalToolAdapter) GetGoal(ctx context.Context, scope, goalID string) (any, error) {
+	return a.service.GetGoal(ctx, scope, goalID)
+}
+
+func (a goalToolAdapter) CreateGoal(ctx context.Context, input tools.GoalCreateInput) (any, error) {
+	return a.service.CreateGoal(ctx, goals.CreateGoalInput{
+		Scope:           input.Scope,
+		ProfileID:       input.ProfileID,
+		SessionID:       input.SessionID,
+		Title:           input.Title,
+		Statement:       input.Statement,
+		SuccessCriteria: input.SuccessCriteria,
+		Status:          input.Status,
+		Priority:        input.Priority,
+		Tags:            input.Tags,
+		State:           input.State,
+		Metadata:        input.Metadata,
+		CreatedByRunID:  input.CreatedByRunID,
+	})
+}
+
+func (a goalToolAdapter) UpdateGoal(ctx context.Context, scope, goalID string, input tools.GoalUpdateInput) (any, error) {
+	return a.service.UpdateGoal(ctx, scope, goalID, goals.UpdateGoalInput{
+		Title:           input.Title,
+		Statement:       input.Statement,
+		SuccessCriteria: input.SuccessCriteria,
+		Status:          input.Status,
+		Priority:        input.Priority,
+		Tags:            input.Tags,
+		State:           input.State,
+		Metadata:        input.Metadata,
+		UpdatedByRunID:  input.UpdatedByRunID,
+	})
+}
+
+func (a goalToolAdapter) ClearGoal(ctx context.Context, scope, goalID string, input tools.GoalClearInput) (any, error) {
+	return a.service.ClearGoal(ctx, scope, goalID, goals.ClearGoalInput{ClearedByRunID: input.ClearedByRunID})
+}
+
+func (a goalToolAdapter) EvaluateGoal(ctx context.Context, scope, goalID string, input tools.GoalEvaluateInput) (any, error) {
+	return a.service.EvaluateGoal(ctx, scope, goalID, goals.EvaluateGoalInput{
+		Evaluation:       input.Evaluation,
+		Status:           input.Status,
+		UpdatedByRunID:   input.UpdatedByRunID,
+		EvaluatedByRunID: input.EvaluatedByRunID,
+	})
 }

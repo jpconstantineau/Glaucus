@@ -22,6 +22,7 @@ import (
 	"github.com/jpconstantineau/Glaucus/internal/config"
 	exportsvc "github.com/jpconstantineau/Glaucus/internal/exports"
 	"github.com/jpconstantineau/Glaucus/internal/features"
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	"github.com/jpconstantineau/Glaucus/internal/kanban"
 	"github.com/jpconstantineau/Glaucus/internal/mcp"
@@ -54,6 +55,7 @@ type Options struct {
 	Profile                 profile.ActiveProfile
 	ProviderCatalog         providers.Catalog
 	SessionService          *sessions.Service
+	GoalService             *goals.Service
 	JobService              *jobs.Service
 	KanbanService           *kanban.Service
 	QueueManager            *kanban.QueueManager

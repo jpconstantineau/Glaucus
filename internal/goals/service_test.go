@@ -82,6 +82,59 @@ func TestCreateAndListGoalsByScope(t *testing.T) {
 	}
 }
 
+func TestUpdateClearAndEvaluateGoal(t *testing.T) {
+	app := newTestApp(t)
+	service := NewService(app)
+	ctx := context.Background()
+
+	goal, err := service.CreateGoal(ctx, CreateGoalInput{
+		Scope:     ScopeSession,
+		ProfileID: "default",
+		SessionID: "session_2",
+		Title:     "Close the loop",
+		Statement: "Ship the follow-up changes with verification.",
+	})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+
+	goal, err = service.UpdateGoal(ctx, ScopeSession, goal.ID, UpdateGoalInput{
+		Statement:      "Ship the follow-up changes with full verification.",
+		Priority:       "high",
+		UpdatedByRunID: "run_update",
+	})
+	if err != nil {
+		t.Fatalf("update goal: %v", err)
+	}
+	if goal.Priority != "high" || goal.Version != 2 || goal.UpdatedByRunID != "run_update" {
+		t.Fatalf("expected updated goal fields, got %#v", goal)
+	}
+
+	goal, err = service.EvaluateGoal(ctx, ScopeSession, goal.ID, EvaluateGoalInput{
+		Evaluation: map[string]any{
+			"outcome": "partial",
+			"summary": "Tests pass but dashboard review remains.",
+		},
+		Status:           "in_review",
+		UpdatedByRunID:   "run_eval",
+		EvaluatedByRunID: "run_eval",
+	})
+	if err != nil {
+		t.Fatalf("evaluate goal: %v", err)
+	}
+	if goal.Status != "in_review" || goal.LastEvaluatedRunID != "run_eval" || len(goal.EvaluationHistory) != 1 {
+		t.Fatalf("expected persisted evaluation, got %#v", goal)
+	}
+
+	goal, err = service.ClearGoal(ctx, ScopeSession, goal.ID, ClearGoalInput{ClearedByRunID: "run_clear"})
+	if err != nil {
+		t.Fatalf("clear goal: %v", err)
+	}
+	if goal.Status != StatusCleared || goal.ClearedByRunID != "run_clear" || goal.ClearedAt.IsZero() {
+		t.Fatalf("expected cleared goal metadata, got %#v", goal)
+	}
+}
+
 func newTestApp(t *testing.T) core.App {
 	t.Helper()
 

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/jpconstantineau/Glaucus/internal/config"
+	"github.com/jpconstantineau/Glaucus/internal/goals"
 	"github.com/jpconstantineau/Glaucus/internal/jobs"
 	_ "github.com/jpconstantineau/Glaucus/internal/migrations"
 	"github.com/jpconstantineau/Glaucus/internal/profile"
@@ -55,6 +56,7 @@ func TestResponsesLifecycleAndModels(t *testing.T) {
 		ProviderCatalog: catalog,
 		Router:          providers.NewRouter(catalog, cfg),
 		SessionService:  sessions.NewService(app),
+		GoalService:     goals.NewService(app),
 		JobService:      nil,
 		EventService:    runtime.NewEventService(app),
 		PromptBuilder:   runtime.NewPromptBuilder(),
@@ -215,6 +217,7 @@ func TestRunsAndJobsAPIs(t *testing.T) {
 		ProviderCatalog: catalog,
 		Router:          routerSvc,
 		SessionService:  sessionService,
+		GoalService:     goals.NewService(app),
 		JobService:      jobService,
 		EventService:    eventService,
 		PromptBuilder:   runtime.NewPromptBuilder(),
@@ -322,5 +325,76 @@ func TestRunsAndJobsAPIs(t *testing.T) {
 	mux.ServeHTTP(getJobRes, getJobReq)
 	if getJobRes.Code != http.StatusOK || !strings.Contains(getJobRes.Body.String(), "history") {
 		t.Fatalf("expected job history payload, got %d %s", getJobRes.Code, getJobRes.Body.String())
+	}
+
+	goalCreateReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/goals", strings.NewReader(`{
+		"scope":"session",
+		"session_id":"`+session.ID+`",
+		"title":"Finish run API coverage",
+		"statement":"Keep lifecycle APIs green.",
+		"success_criteria":"List, update, clear, and evaluate all work."
+	}`))
+	goalCreateReq.Header.Set("Authorization", "Bearer test-token")
+	goalCreateReq.Header.Set("Content-Type", "application/json")
+	goalCreateRes := httptest.NewRecorder()
+	mux.ServeHTTP(goalCreateRes, goalCreateReq)
+	if goalCreateRes.Code != http.StatusOK {
+		t.Fatalf("expected goal create 200, got %d: %s", goalCreateRes.Code, goalCreateRes.Body.String())
+	}
+	var createdGoal struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(goalCreateRes.Body.Bytes(), &createdGoal); err != nil {
+		t.Fatalf("decode goal create response: %v", err)
+	}
+	goalID, _ := createdGoal.Data["ID"].(string)
+	if goalID == "" {
+		t.Fatalf("expected goal ID in payload, got %s", goalCreateRes.Body.String())
+	}
+
+	goalPatchReq := httptest.NewRequest(http.MethodPatch, "http://example.com/v1/goals/session/"+goalID, strings.NewReader(`{
+		"priority":"high",
+		"status":"in_review"
+	}`))
+	goalPatchReq.SetPathValue("scope", "session")
+	goalPatchReq.SetPathValue("goalID", goalID)
+	goalPatchReq.Header.Set("Authorization", "Bearer test-token")
+	goalPatchReq.Header.Set("Content-Type", "application/json")
+	goalPatchRes := httptest.NewRecorder()
+	mux.ServeHTTP(goalPatchRes, goalPatchReq)
+	if goalPatchRes.Code != http.StatusOK || !strings.Contains(goalPatchRes.Body.String(), "in_review") {
+		t.Fatalf("expected goal patch response, got %d %s", goalPatchRes.Code, goalPatchRes.Body.String())
+	}
+
+	goalEvalReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/goals/session/"+goalID+"/evaluate", strings.NewReader(`{
+		"status":"satisfied",
+		"evaluation":{"summary":"verification complete","outcome":"met"}
+	}`))
+	goalEvalReq.SetPathValue("scope", "session")
+	goalEvalReq.SetPathValue("goalID", goalID)
+	goalEvalReq.Header.Set("Authorization", "Bearer test-token")
+	goalEvalReq.Header.Set("Content-Type", "application/json")
+	goalEvalRes := httptest.NewRecorder()
+	mux.ServeHTTP(goalEvalRes, goalEvalReq)
+	if goalEvalRes.Code != http.StatusOK || !strings.Contains(goalEvalRes.Body.String(), "verification complete") {
+		t.Fatalf("expected goal evaluation response, got %d %s", goalEvalRes.Code, goalEvalRes.Body.String())
+	}
+
+	goalListReq := httptest.NewRequest(http.MethodGet, "http://example.com/v1/goals?scope=session&session_id="+session.ID, nil)
+	goalListReq.Header.Set("Authorization", "Bearer test-token")
+	goalListRes := httptest.NewRecorder()
+	mux.ServeHTTP(goalListRes, goalListReq)
+	if goalListRes.Code != http.StatusOK || !strings.Contains(goalListRes.Body.String(), "Finish run API coverage") {
+		t.Fatalf("expected goal list response, got %d %s", goalListRes.Code, goalListRes.Body.String())
+	}
+
+	goalClearReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/goals/session/"+goalID+"/clear", nil)
+	goalClearReq.SetPathValue("scope", "session")
+	goalClearReq.SetPathValue("goalID", goalID)
+	goalClearReq.Header.Set("Authorization", "Bearer test-token")
+	goalClearRes := httptest.NewRecorder()
+	mux.ServeHTTP(goalClearRes, goalClearReq)
+	if goalClearRes.Code != http.StatusOK || !strings.Contains(goalClearRes.Body.String(), goals.StatusCleared) {
+		t.Fatalf("expected goal clear response, got %d %s", goalClearRes.Code, goalClearRes.Body.String())
 	}
 }
