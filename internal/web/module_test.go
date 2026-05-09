@@ -158,6 +158,20 @@ func TestHealthAndAuthenticatedDashboardFlow(t *testing.T) {
 		t.Fatalf("expected 200 from /health, got %d", healthRes.Code)
 	}
 
+	assetReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/assets/app.css", nil)
+	assetReq.Host = "127.0.0.1:8090"
+	assetRes := httptest.NewRecorder()
+	mux.ServeHTTP(assetRes, assetReq)
+	if assetRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 from shared stylesheet, got %d", assetRes.Code)
+	}
+	if contentType := assetRes.Result().Header.Get("Content-Type"); !strings.Contains(contentType, "text/css") {
+		t.Fatalf("expected css content type, got %q", contentType)
+	}
+	if !strings.Contains(assetRes.Body.String(), "--accent") {
+		t.Fatalf("expected shared stylesheet contents, got %s", assetRes.Body.String())
+	}
+
 	loginPageReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/login", nil)
 	loginPageReq.Host = "127.0.0.1:8090"
 	loginPageRes := httptest.NewRecorder()
@@ -466,6 +480,9 @@ func TestLoginFailureRendersLoginPageError(t *testing.T) {
 	mux.ServeHTTP(loginPageRes, loginPageReq)
 	if loginPageRes.Code != http.StatusOK {
 		t.Fatalf("expected 200 from /login, got %d", loginPageRes.Code)
+	}
+	if !strings.Contains(loginPageRes.Body.String(), `/assets/app.css`) {
+		t.Fatalf("expected login page to link shared stylesheet, got %s", loginPageRes.Body.String())
 	}
 
 	csrfCookie := loginPageRes.Result().Cookies()[0]

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/rand"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -45,6 +46,9 @@ const (
 	sessionCookieName = "glaucus_session"
 	csrfCookieName    = "glaucus_csrf"
 )
+
+//go:embed static/*
+var staticAssets embed.FS
 
 type Options struct {
 	AppName                 string
@@ -111,6 +115,7 @@ func (m *Module) BindRoutes(app core.App, rg *router.Router[*core.RequestEvent])
 	})
 	rg.GET("/health", m.publicHealth)
 	rg.GET("/metrics", m.metrics)
+	rg.GET("/assets/app.css", m.sharedStylesheet)
 	rg.GET("/login", m.loginPage)
 	rg.POST("/login", m.loginSubmit)
 	rg.POST("/logout", m.withOperatorAuth(m.logoutSubmit))
@@ -217,6 +222,20 @@ func (m *Module) metrics(e *core.RequestEvent) error {
 	applyLocalWebSafetyHeaders(e.Response)
 	e.Response.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	_, err = e.Response.Write([]byte(m.options.ObservabilityService.Prometheus(snapshot)))
+	return err
+}
+
+func (m *Module) sharedStylesheet(e *core.RequestEvent) error {
+	if err := m.requireLocalHost(e); err != nil {
+		return err
+	}
+	data, err := staticAssets.ReadFile("static/app.css")
+	if err != nil {
+		return e.InternalServerError("failed to load stylesheet", err)
+	}
+	applyLocalWebSafetyHeaders(e.Response)
+	e.Response.Header().Set("Content-Type", "text/css; charset=utf-8")
+	_, err = e.Response.Write(data)
 	return err
 }
 
@@ -1851,16 +1870,7 @@ var loginPageTmpl = template.Must(template.New("login").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Login</title>
-  <style>
-    body { font-family: Georgia, serif; background: linear-gradient(135deg, #f3efe4, #dbe7f0); color: #1f2933; margin: 0; }
-    main { max-width: 28rem; margin: 4rem auto; background: rgba(255,255,255,.92); padding: 2rem; border-radius: 1rem; box-shadow: 0 20px 60px rgba(15, 23, 42, .15); }
-    label, input { display: block; width: 100%; }
-    input { margin: .4rem 0 1rem; padding: .8rem; border: 1px solid #c7d2da; border-radius: .6rem; box-sizing: border-box; }
-    button { background: #1f5c4a; color: #fff; border: 0; border-radius: .6rem; padding: .8rem 1rem; width: 100%; }
-    .hint { color: #52606d; font-size: .95rem; }
-    .error { background: #fff1f2; border: 1px solid #fecdd3; color: #9f1239; border-radius: .6rem; padding: .75rem .9rem; }
-  </style>
+  <title>{{.AppName}} Login</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <main>
@@ -1884,21 +1894,7 @@ var dashboardPageTmpl = template.Must(template.New("dashboard").Parse(`<!doctype
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Dashboard</title>
-  <style>
-    :root { --ink: #102a43; --muted: #627d98; --card: rgba(255,255,255,.88); --accent: #0f766e; --bg-a: #f6efe6; --bg-b: #d9e7ef; }
-    body { margin: 0; font-family: "Trebuchet MS", sans-serif; color: var(--ink); background: radial-gradient(circle at top left, var(--bg-a), var(--bg-b)); }
-    header, main { max-width: 64rem; margin: 0 auto; padding: 1.5rem; }
-    header { display: flex; justify-content: space-between; align-items: center; }
-    .brand { font-size: 1.8rem; font-weight: 700; letter-spacing: .04em; }
-    .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1rem; }
-    .card, .panel { background: var(--card); border-radius: 1rem; padding: 1.25rem; box-shadow: 0 18px 40px rgba(16, 42, 67, .12); }
-    .label { color: var(--muted); text-transform: uppercase; font-size: .78rem; letter-spacing: .08em; }
-    .value { font-size: 1.7rem; margin-top: .4rem; }
-    .panel { margin-top: 1rem; }
-    button { background: var(--accent); color: #fff; border: 0; border-radius: .6rem; padding: .7rem 1rem; }
-    a { color: var(--accent); }
-  </style>
+  <title>{{.AppName}} Dashboard</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <header>
@@ -1954,11 +1950,7 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Glaucus Status</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 42rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-  </style>
+  <title>Glaucus Status</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -1979,38 +1971,7 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Chat</title>
-  <style>
-    :root { --ink: #1d2733; --muted: #61788a; --paper: rgba(255,255,255,.9); --line: #d6e0e8; --accent: #0d6b5f; --bg-a: #f8ead8; --bg-b: #dceaf0; }
-    body { margin: 0; font-family: "Trebuchet MS", sans-serif; color: var(--ink); background: linear-gradient(145deg, var(--bg-a), var(--bg-b)); }
-    header { display: flex; justify-content: space-between; align-items: center; max-width: 78rem; margin: 0 auto; padding: 1.25rem 1.5rem; }
-    header a { color: var(--accent); text-decoration: none; }
-    main { max-width: 78rem; margin: 0 auto; padding: 0 1.5rem 1.5rem; display: grid; grid-template-columns: 20rem 1fr; gap: 1rem; }
-    .panel { background: var(--paper); border-radius: 1rem; box-shadow: 0 20px 45px rgba(29,39,51,.10); }
-    .sessions { padding: 1rem; }
-    .session-list { display: grid; gap: .6rem; margin-top: 1rem; }
-    .session-item { display: block; padding: .8rem .9rem; border-radius: .8rem; text-decoration: none; color: inherit; background: rgba(13,107,95,.06); }
-    .session-item.active { background: var(--accent); color: white; }
-    .session-title { font-weight: 700; }
-    .session-meta { font-size: .85rem; opacity: .8; margin-top: .25rem; }
-    .chat { padding: 1rem; display: grid; gap: 1rem; }
-    .toolbar { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: .8rem; }
-    .toolbar label { display: grid; gap: .35rem; font-size: .85rem; color: var(--muted); }
-    select, textarea, button { font: inherit; }
-    select, textarea { width: 100%; border: 1px solid var(--line); border-radius: .8rem; padding: .75rem; box-sizing: border-box; background: #fff; }
-    textarea { min-height: 8rem; resize: vertical; }
-    button { border: 0; border-radius: .8rem; background: var(--accent); color: white; padding: .85rem 1.1rem; cursor: pointer; }
-    .transcript, .stream { border: 1px solid var(--line); border-radius: .9rem; background: #fff; padding: 1rem; }
-    .transcript-list { display: grid; gap: .8rem; }
-    .message { border-radius: .9rem; padding: .9rem 1rem; }
-    .message.user { background: #eef6ff; }
-    .message.assistant { background: #f3faf7; }
-    .message .role { font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: .35rem; }
-    .stream pre { white-space: pre-wrap; margin: .75rem 0 0; font-family: Consolas, monospace; }
-    .hint { color: var(--muted); font-size: .92rem; }
-    .empty { color: var(--muted); font-style: italic; }
-    @media (max-width: 860px) { main { grid-template-columns: 1fr; } .toolbar { grid-template-columns: 1fr; } }
-  </style>
+  <title>{{.AppName}} Chat</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <header>
@@ -2462,16 +2423,7 @@ var approvalsPageTmpl = template.Must(template.New("approvals").Parse(`<!doctype
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Approvals</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 68rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .request { border: 1px solid #d9e2ec; border-radius: .85rem; padding: 1rem; margin-top: 1rem; }
-    .meta { color: #52606d; font-size: .9rem; }
-    form { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .75rem; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-    .deny { background: #b42318; }
-  </style>
+  <title>{{.AppName}} Approvals</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2506,13 +2458,7 @@ var toolsPageTmpl = template.Must(template.New("tools").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Tools</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 68rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .tool { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-    .meta { color: #52606d; font-size: .9rem; }
-  </style>
+  <title>{{.AppName}} Tools</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2553,24 +2499,7 @@ var kanbanPageTmpl = template.Must(template.New("kanban").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Kanban</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 84rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .board { border: 1px solid #d9e2ec; border-radius: .95rem; padding: 1rem; margin-top: 1rem; }
-    .task { border: 1px solid #bcccdc; border-radius: .85rem; padding: .9rem; margin-top: .9rem; background: #f8fbfc; }
-    .comment { border-left: 3px solid #0f766e; padding-left: .65rem; margin-top: .65rem; color: #334e68; }
-    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); }
-    .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
-    form { display: grid; gap: .65rem; margin-top: .75rem; }
-    input, textarea, select, button { font: inherit; }
-    input, textarea, select { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; box-sizing: border-box; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-    .subtle { background: #486581; }
-    .danger { background: #b42318; }
-    .meta { color: #52606d; font-size: .95rem; }
-    code { background: #eef2f6; padding: .1rem .35rem; border-radius: .4rem; }
-  </style>
+  <title>{{.AppName}} Kanban</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2712,16 +2641,7 @@ var sessionsPageTmpl = template.Must(template.New("sessions").Parse(`<!doctype h
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Sessions</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-    form { display: flex; gap: .5rem; }
-    input, button { font: inherit; }
-    input { flex: 1; padding: .6rem .75rem; border: 1px solid #d9e2ec; border-radius: .6rem; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-  </style>
+  <title>{{.AppName}} Sessions</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2760,20 +2680,7 @@ var goalsPageTmpl = template.Must(template.New("goals").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Goals</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 78rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .9rem; margin-top: .85rem; }
-    .meta { color: #52606d; font-size: .95rem; }
-    form { display: grid; gap: .6rem; margin-top: .6rem; }
-    input, textarea, select, button { font: inherit; }
-    input, textarea, select { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; box-sizing: border-box; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-    .subtle { background: #486581; }
-    .danger { background: #b42318; }
-  </style>
+  <title>{{.AppName}} Goals</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2936,13 +2843,7 @@ var runDetailPageTmpl = template.Must(template.New("run-detail").Parse(`<!doctyp
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Run Detail</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .event { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-    pre { white-space: pre-wrap; }
-  </style>
+  <title>{{.AppName}} Run Detail</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -2971,14 +2872,7 @@ var jobsPageTmpl = template.Must(template.New("jobs").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Jobs</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-    form { display: inline-flex; gap: .5rem; margin-top: .5rem; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-  </style>
+  <title>{{.AppName}} Jobs</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -3012,17 +2906,7 @@ var batchesPageTmpl = template.Must(template.New("batches").Parse(`<!doctype htm
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Batch Jobs</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 78rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-    form { display: grid; gap: .65rem; }
-    input, textarea, button { font: inherit; }
-    input, textarea { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; box-sizing: border-box; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-  </style>
+  <title>{{.AppName}} Batch Jobs</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -3079,20 +2963,7 @@ var adaptersPageTmpl = template.Must(template.New("adapters").Parse(`<!doctype h
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Messaging Adapters</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 76rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: 1rem; margin-top: .9rem; }
-    .log { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; background: #f8fbfc; }
-    .meta { color: #52606d; font-size: .95rem; }
-    form { display: grid; gap: .65rem; margin-top: .75rem; }
-    textarea, input, button { font: inherit; }
-    textarea, input[type="text"] { width: 100%; padding: .65rem .8rem; border: 1px solid #d9e2ec; border-radius: .65rem; }
-    .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
-    button { border: 0; border-radius: .65rem; padding: .65rem .9rem; background: #0f766e; color: white; }
-    code { background: #eef2f6; padding: .1rem .35rem; border-radius: .4rem; }
-  </style>
+  <title>{{.AppName}} Messaging Adapters</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -3153,12 +3024,7 @@ var skillsPageTmpl = template.Must(template.New("skills").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Skills</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    .item { border: 1px solid #d9e2ec; border-radius: .85rem; padding: .8rem; margin-top: .75rem; }
-  </style>
+  <title>{{.AppName}} Skills</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -3182,12 +3048,7 @@ var logsPageTmpl = template.Must(template.New("logs").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.AppName}} Logs</title>
-  <style>
-    body { font-family: "Trebuchet MS", sans-serif; background: #f4f7f9; color: #102a43; margin: 0; padding: 2rem; }
-    .panel { max-width: 72rem; margin: 0 auto; background: #fff; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 30px rgba(16, 42, 67, .10); }
-    pre { white-space: pre-wrap; background: #102a43; color: #f0f4f8; padding: 1rem; border-radius: .85rem; }
-  </style>
+  <title>{{.AppName}} Logs</title>  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <section class="panel">
@@ -3296,3 +3157,5 @@ func (m *Module) batchExecutor() batchsvc.RuntimeExecutor {
 		ToolRegistry:  m.options.ToolRegistry,
 	}
 }
+
+
