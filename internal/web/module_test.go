@@ -420,6 +420,81 @@ func TestLoginPageReusesExistingCSRFCookie(t *testing.T) {
 	}
 }
 
+func TestLoginFailureRendersLoginPageError(t *testing.T) {
+	app := core.NewBaseApp(core.BaseAppConfig{
+		DataDir:       t.TempDir(),
+		EncryptionEnv: "GLAUCUS_TEST_ENCRYPTION_KEY",
+	})
+	t.Setenv("GLAUCUS_TEST_ENCRYPTION_KEY", "12345678901234567890123456789012")
+	t.Cleanup(func() {
+		_ = app.ResetBootstrapState()
+	})
+
+	if err := app.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap app: %v", err)
+	}
+	if err := app.RunAllMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	if err := EnsureDefaultOperator(app, "admin@glaucus.local", "glaucus-admin"); err != nil {
+		t.Fatalf("ensure operator: %v", err)
+	}
+
+	router, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatalf("new router: %v", err)
+	}
+
+	module := &Module{options: Options{
+		AppName:              "Glaucus",
+		BindAddress:          "127.0.0.1:8090",
+		SessionTTL:           24 * time.Hour,
+		Profile:              profile.ActiveProfile{Slug: "default"},
+		ProviderCatalog:      providers.Catalog{},
+		DefaultOperatorEmail: "admin@glaucus.local",
+	}}
+	module.BindRoutes(app, router)
+
+	mux, err := router.BuildMux()
+	if err != nil {
+		t.Fatalf("build mux: %v", err)
+	}
+
+	loginPageReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8090/login", nil)
+	loginPageReq.Host = "127.0.0.1:8090"
+	loginPageRes := httptest.NewRecorder()
+	mux.ServeHTTP(loginPageRes, loginPageReq)
+	if loginPageRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /login, got %d", loginPageRes.Code)
+	}
+
+	csrfCookie := loginPageRes.Result().Cookies()[0]
+	csrfToken := extractValue(loginPageRes.Body.String(), `name="csrf" value="`, `"`)
+
+	form := url.Values{
+		"csrf":     {csrfToken},
+		"email":    {"admin@glaucus.local"},
+		"password": {"wrong-password"},
+	}
+	loginReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8090/login", strings.NewReader(form.Encode()))
+	loginReq.Host = "127.0.0.1:8090"
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginReq.AddCookie(csrfCookie)
+	loginRes := httptest.NewRecorder()
+	mux.ServeHTTP(loginRes, loginReq)
+
+	if loginRes.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized status, got %d", loginRes.Code)
+	}
+	body := loginRes.Body.String()
+	if !strings.Contains(body, "Invalid credentials.") {
+		t.Fatalf("expected inline login error, got %s", body)
+	}
+	if strings.Contains(body, `{"data":`) {
+		t.Fatalf("expected login page html instead of json error, got %s", body)
+	}
+}
+
 func extractValue(body, prefix, suffix string) string {
 	start := strings.Index(body, prefix)
 	if start == -1 {

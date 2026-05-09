@@ -84,6 +84,13 @@ type Module struct {
 	options Options
 }
 
+type loginPageData struct {
+	AppName              string
+	CSRF                 string
+	DefaultOperatorEmail string
+	ErrorMessage         string
+}
+
 func Register(app core.App, options Options) *Module {
 	module := &Module{options: options}
 
@@ -223,14 +230,11 @@ func (m *Module) loginPage(e *core.RequestEvent) error {
 		return e.InternalServerError("failed to create login form", err)
 	}
 
-	data := struct {
-		AppName              string
-		CSRF                 string
-		DefaultOperatorEmail string
-	}{
+	data := loginPageData{
 		AppName:              m.options.AppName,
 		CSRF:                 csrfToken,
 		DefaultOperatorEmail: m.options.DefaultOperatorEmail,
+		ErrorMessage:         strings.TrimSpace(e.Request.URL.Query().Get("error")),
 	}
 
 	return e.HTML(http.StatusOK, loginTemplate(data))
@@ -248,12 +252,12 @@ func (m *Module) loginSubmit(e *core.RequestEvent) error {
 	email := strings.TrimSpace(e.Request.FormValue("email"))
 	password := e.Request.FormValue("password")
 	if email == "" || password == "" {
-		return e.BadRequestError("email and password are required", nil)
+		return m.renderLoginError(e, http.StatusBadRequest, "Email and password are required.")
 	}
 
 	record, err := e.App.FindAuthRecordByEmail("operators", email)
 	if err != nil || !record.ValidatePassword(password) {
-		return e.UnauthorizedError("invalid credentials", err)
+		return m.renderLoginError(e, http.StatusUnauthorized, "Invalid credentials.")
 	}
 
 	token, err := record.NewStaticAuthToken(m.options.SessionTTL)
@@ -271,6 +275,20 @@ func (m *Module) loginSubmit(e *core.RequestEvent) error {
 	})
 
 	return e.Redirect(http.StatusSeeOther, "/dashboard")
+}
+
+func (m *Module) renderLoginError(e *core.RequestEvent, status int, message string) error {
+	csrfToken, err := ensureCSRFCookie(e)
+	if err != nil {
+		return e.InternalServerError("failed to create login form", err)
+	}
+
+	return e.HTML(status, loginTemplate(loginPageData{
+		AppName:              m.options.AppName,
+		CSRF:                 csrfToken,
+		DefaultOperatorEmail: m.options.DefaultOperatorEmail,
+		ErrorMessage:         message,
+	}))
 }
 
 func (m *Module) logoutSubmit(e *core.RequestEvent, _ *core.Record) error {
@@ -1841,12 +1859,14 @@ var loginPageTmpl = template.Must(template.New("login").Parse(`<!doctype html>
     input { margin: .4rem 0 1rem; padding: .8rem; border: 1px solid #c7d2da; border-radius: .6rem; box-sizing: border-box; }
     button { background: #1f5c4a; color: #fff; border: 0; border-radius: .6rem; padding: .8rem 1rem; width: 100%; }
     .hint { color: #52606d; font-size: .95rem; }
+    .error { background: #fff1f2; border: 1px solid #fecdd3; color: #9f1239; border-radius: .6rem; padding: .75rem .9rem; }
   </style>
 </head>
 <body>
   <main>
     <h1>{{.AppName}}</h1>
     <p class="hint">Sign in with the local operator account. Default bootstrap email: <strong>{{.DefaultOperatorEmail}}</strong></p>
+    {{if .ErrorMessage}}<p class="error" role="alert">{{.ErrorMessage}}</p>{{end}}
     <form method="post" action="/login">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <label for="email">Email</label>
